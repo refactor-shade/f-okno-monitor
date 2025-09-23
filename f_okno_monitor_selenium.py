@@ -117,31 +117,35 @@ def login(driver: webdriver.Chrome):
     wait.until(EC.presence_of_element_located((By.TAG_NAME, "body")))
     log.info("Логин завершён, целевая страница открыта.")
 
-
 def parse_slots_from_html(html: str) -> List[Dict]:
-    """Подстрой CSS-селекторы под реальную разметку страницы со слотами."""
     soup = BeautifulSoup(html, "lxml")
-    slots = []
 
-    # === ПРИМЕР: замените селекторы ниже на реальные ===
-    slot_nodes = soup.select(".slots-list .slot")
-    if slot_nodes:
-        for node in slot_nodes:
-            date = node.select_one(".date").get_text(strip=True) if node.select_one(".date") else ""
-            time_ = node.select_one(".time").get_text(strip=True) if node.select_one(".time") else ""
-            status = node.select_one(".status").get_text(strip=True) if node.select_one(".status") else ""
-            if not status:
-                btn = node.select_one("button, a")
-                if btn and ("Записаться" in btn.get_text() or "Свобод" in btn.get_text()):
-                    status = "Свободно"
-            slots.append({"date": date, "time": time_, "status": status})
-        return slots
+    out: List[Dict] = []
+    items = soup.select("#graphic_container .graphic_item")
+    if not items:
+        # fallback: если верстка поменялась, хотя бы понять есть ли свободно
+        text = soup.get_text(" ", strip=True)
+        status = "Свободно" if ("Записаться" in text or "Свобод" in text) else "Нет мест"
+        return [{"date": "", "time": "", "status": status}]
 
-    # Fallback: грубый признак наличия своб. слотов
-    text = soup.get_text("\n", strip=True)
-    status = "Свободно" if ("Свобод" in text or "Записаться" in text) else "Недоступно/не найдено"
-    slots.append({"date": "", "time": "", "status": status})
-    return slots
+    for item in items:
+        # дата дня
+        date_el = item.select_one(".graphic_item_date")
+        date_txt = date_el.get_text(" ", strip=True) if date_el else ""
+
+        # статус дня: busy/grey/disabled = нет мест
+        classes = item.get("class", [])
+        if any(c in classes for c in ("busy", "grey", "disabled")):
+            status = "Нет мест"
+        else:
+            # если когда-нибудь появится день со свободными слотами
+            slots_el = item.select_one(".graphic_item_slots")
+            slots_txt = slots_el.get_text(" ", strip=True) if slots_el else ""
+            status = "Свободно" if ("Записаться" in slots_txt or "Свобод" in slots_txt) else "Нет мест"
+
+        out.append({"date": date_txt, "time": "", "status": status})
+
+    return out
 
 
 def load_last_snapshot() -> str:
