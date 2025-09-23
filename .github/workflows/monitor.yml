@@ -17,9 +17,10 @@ jobs:
         with:
           python-version: "3.11"
 
-      # Ставим Chrome (драйвер подтянет webdriver-manager из кода)
+      # Ставит Google Chrome и прокидывает CHROME_PATH в окружение
       - name: Install Chrome
         uses: browser-actions/setup-chrome@v1
+        id: chrome
 
       - name: Install Python deps
         run: |
@@ -34,4 +35,6 @@ jobs:
           F_OKNO_PASSWORD: ${{ secrets.F_OKNO_PASSWORD }}
           TARGET_URL: https://f-okno.ru/base/moscovskaya_oblast/sizo11noginsk
           LOGIN_URL: https://f-okno.ru/login?request_uri=%2Fbase%2Fmoscovskaya_oblast%2Fsizo11noginsk
+          # Важно: передаём путь к установленному Chrome в скрипт
+          CHROME_PATH: ${{ steps.chrome.outputs.chrome-path }}
         run: python f_okno_monitor_selenium.py
