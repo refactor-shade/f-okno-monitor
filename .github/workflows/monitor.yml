@@ -3,7 +3,7 @@ name: Monitor SIZO-11 slots
 on:
   workflow_dispatch: {}
   schedule:
-    - cron: "*/10 * * * *"  # запуск каждые 10 минут
+    - cron: "*/10 * * * *"  # каждые 10 минут
 
 jobs:
   run-monitor:
@@ -18,7 +18,7 @@ jobs:
         with:
           python-version: "3.11"
 
-      # Ставит Google Chrome и отдаёт путь в output chrome-path
+      # Ставим Chrome и получаем путь в outputs.chrome-path
       - name: Install Chrome
         id: chrome
         uses: browser-actions/setup-chrome@v1
@@ -28,7 +28,7 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      # Основной прогон; весь вывод пишем в run.log
+      # Основной прогон (пишем stdout+stderr в run.log)
       - name: Run monitor (single check)
         id: run
         shell: bash
@@ -54,7 +54,7 @@ jobs:
           exit $code
         continue-on-error: true
 
-      # Если основной шаг упал, делаем простой smoke-test, чтобы получить HTML/скрин
+      # Если основной шаг упал — делаем smoke-test, чтобы получить HTML/скрин
       - name: Smoke test (screenshot login page)
         if: steps.run.outcome == 'failure'
         shell: bash
@@ -63,33 +63,45 @@ jobs:
           LOGIN_URL: https://f-okno.ru/login?request_uri=%2Fbase%2Fmoscovskaya_oblast%2Fsizo11noginsk
         run: |
           set -euo pipefail
-          python <<'PY'
-import os, time
-from selenium import webdriver
-from selenium.webdriver.chrome.options import Options
-from selenium.webdriver.chrome.service import Service
-from webdriver_manager.chrome import ChromeDriverManager
+          python - <<'PY'
+          import os, time
+          from selenium import webdriver
+          from selenium.webdriver.chrome.options import Options
+          from selenium.webdriver.chrome.service import Service
+          from webdriver_manager.chrome import ChromeDriverManager
 
-opts = Options()
-opts.add_argument("--headless=new")
-opts.add_argument("--no-sandbox")
-opts.add_argument("--disable-dev-shm-usage")
-opts.add_argument("--window-size=1280,2000")
-if os.getenv("CHROME_PATH"):
-    opts.binary_location = os.getenv("CHROME_PATH")
+          opts = Options()
+          opts.add_argument("--headless=new")
+          opts.add_argument("--no-sandbox")
+          opts.add_argument("--disable-dev-shm-usage")
+          opts.add_argument("--window-size=1280,2000")
+          if os.getenv("CHROME_PATH"):
+              opts.binary_location = os.getenv("CHROME_PATH")
 
-service = Service(ChromeDriverManager().install())
-drv = webdriver.Chrome(service=service, options=opts)
-try:
-    url = os.getenv("LOGIN_URL")
-    print("Opening:", url, flush=True)
-    drv.get(url)
-    time.sleep(2)
-    open("page.html","w",encoding="utf-8").write(drv.page_source)
-    drv.save_screenshot("page.png")
-    print("Smoke test OK", flush=True)
-finally:
-    drv.quit()
-PY
+          service = Service(ChromeDriverManager().install())
+          drv = webdriver.Chrome(service=service, options=opts)
+          try:
+              url = os.getenv("LOGIN_URL")
+              print("Opening:", url, flush=True)
+              drv.get(url)
+              time.sleep(2)
+              open("page.html","w",encoding="utf-8").write(drv.page_source)
+              drv.save_screenshot("page.png")
+              print("Smoke test OK", flush=True)
+          finally:
+              drv.quit()
+          PY
 
-      - name: Upload debug art
+      - name: Upload debug artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: debug
+          path: |
+            run.log
+            page.html
+            page.png
+
+      - name: Fail if script failed
+        if: steps.run.outcome == 'failure'
+        run: exit 1
