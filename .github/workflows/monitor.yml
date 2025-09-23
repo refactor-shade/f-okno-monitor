@@ -42,6 +42,7 @@ jobs:
           TARGET_URL: https://f-okno.ru/base/moscovskaya_oblast/sizo11noginsk
           LOGIN_URL: https://f-okno.ru/login?request_uri=%2Fbase%2Fmoscovskaya_oblast%2Fsizo11noginsk
           CHROME_PATH: ${{ steps.chrome.outputs.chrome-path }}
+          ONLY_NOTIFY_WHEN_FREE: "1"
         run: |
           set -euo pipefail
           export PYTHONUNBUFFERED=1
