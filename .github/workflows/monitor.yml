@@ -3,11 +3,12 @@ name: Monitor SIZO-11 slots
 on:
   workflow_dispatch: {}
   schedule:
-    - cron: "*/10 * * * *"  # каждые 10 минут
+    - cron: "*/10 * * * *"  # запуск каждые 10 минут
 
 jobs:
   run-monitor:
     runs-on: ubuntu-latest
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -17,6 +18,7 @@ jobs:
         with:
           python-version: "3.11"
 
+      # Ставит Google Chrome и отдаёт путь в output chrome-path
       - name: Install Chrome
         id: chrome
         uses: browser-actions/setup-chrome@v1
@@ -26,9 +28,10 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      # Основной прогон: весь вывод → run.log, артефакты создаём заранее
+      # Основной прогон; весь вывод пишем в run.log
       - name: Run monitor (single check)
         id: run
+        shell: bash
         env:
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
@@ -37,7 +40,6 @@ jobs:
           TARGET_URL: https://f-okno.ru/base/moscovskaya_oblast/sizo11noginsk
           LOGIN_URL: https://f-okno.ru/login?request_uri=%2Fbase%2Fmoscovskaya_oblast%2Fsizo11noginsk
           CHROME_PATH: ${{ steps.chrome.outputs.chrome-path }}
-        shell: bash
         run: |
           set -euo pipefail
           export PYTHONUNBUFFERED=1
@@ -46,27 +48,26 @@ jobs:
           : > page.png  || true
           echo "Python: $(python -V)" | tee -a run.log
           echo "Chrome path: ${CHROME_PATH:-<empty>}" | tee -a run.log
-          which python | tee -a run.log
-          # Запуск скрипта, весь stdout+stderr → run.log
           python f_okno_monitor_selenium.py 2>&1 | tee -a run.log
-          STATUS=${PIPESTATUS[0]}
-          echo "Exit status: $STATUS" | tee -a run.log
-          exit $STATUS
+          code=${PIPESTATUS[0]}
+          echo "Exit status: $code" | tee -a run.log
+          exit $code
         continue-on-error: true
 
-      # Если основная проверка упала — делаем «дымовую» проверку Chrome+Selenium
-      - name: Smoke test (open login page and screenshot)
+      # Если основной шаг упал, делаем простой smoke-test, чтобы получить HTML/скрин
+      - name: Smoke test (screenshot login page)
         if: steps.run.outcome == 'failure'
+        shell: bash
         env:
           CHROME_PATH: ${{ steps.chrome.outputs.chrome-path }}
           LOGIN_URL: https://f-okno.ru/login?request_uri=%2Fbase%2Fmoscovskaya_oblast%2Fsizo11noginsk
-        shell: bash
         run: |
           set -euo pipefail
-          python - << 'PY'
+          python <<'PY'
 import os, time
 from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.chrome.service import Service
 from webdriver_manager.chrome import ChromeDriverManager
 
 opts = Options()
@@ -76,29 +77,19 @@ opts.add_argument("--disable-dev-shm-usage")
 opts.add_argument("--window-size=1280,2000")
 if os.getenv("CHROME_PATH"):
     opts.binary_location = os.getenv("CHROME_PATH")
-drv = webdriver.Chrome(ChromeDriverManager().install(), options=opts)
+
+service = Service(ChromeDriverManager().install())
+drv = webdriver.Chrome(service=service, options=opts)
 try:
     url = os.getenv("LOGIN_URL")
-    print("Opening:", url)
+    print("Opening:", url, flush=True)
     drv.get(url)
     time.sleep(2)
     open("page.html","w",encoding="utf-8").write(drv.page_source)
     drv.save_screenshot("page.png")
-    print("Smoke test OK")
+    print("Smoke test OK", flush=True)
 finally:
     drv.quit()
 PY
 
-      - name: Upload debug artifacts
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: debug
-          path: |
-            page.png
-            page.html
-            run.log
-
-      - name: Fail if script failed
-        if: steps.run.outcome == 'failure'
-        run: exit 1
+      - name: Upload debug art
