@@ -75,19 +75,23 @@ def make_driver() -> webdriver.Chrome:
     drv.set_page_load_timeout(60)
     return drv
 
-
 def login(driver: webdriver.Chrome):
     log.info("Открываю страницу логина…")
     driver.get(LOGIN_URL)
     wait = WebDriverWait(driver, 20)
 
-    # Подстрой при необходимости под реальные селекторы формы:
-    email_candidates = [(By.NAME, "email"), (By.CSS_SELECTOR, "input[type='email']"), (By.ID, "email")]
-    pwd_candidates   = [(By.NAME, "password"), (By.CSS_SELECTOR, "input[type='password']"), (By.ID, "password")]
-    submit_candidates= [
-        (By.CSS_SELECTOR, "form button[type='submit']"),
-        (By.XPATH, "//form//button[contains(.,'Войти') or contains(.,'Авторизоваться')]"),
-        (By.CSS_SELECTOR, "button[type='submit']")
+    # Правильные селекторы для f-okno (заменили email->login, password->pass)
+    email_candidates = [
+        (By.NAME, "login"),
+        (By.CSS_SELECTOR, "input[name='login']"),
+    ]
+    pwd_candidates = [
+        (By.NAME, "pass"),
+        (By.CSS_SELECTOR, "input[name='pass']"),
+    ]
+    submit_candidates = [
+        (By.CSS_SELECTOR, "#login_form .pre_button"),
+        (By.XPATH, "//a[contains(.,'Авторизоваться')]"),
     ]
 
     def find_first(cands):
@@ -98,12 +102,16 @@ def login(driver: webdriver.Chrome):
                 continue
         raise RuntimeError(f"Элемент не найден. Проверь селекторы: {cands}")
 
+    # Находим поля и вводим учётки
     email_input = find_first(email_candidates)
-    pwd_input   = find_first(pwd_candidates)
+    pwd_input = find_first(pwd_candidates)
     email_input.clear(); email_input.send_keys(EMAIL)
     pwd_input.clear();   pwd_input.send_keys(PASSWORD)
+
+    # Нажимаем кнопку авторизации (это <a ... onclick="doForm('login_form')">)
     find_first(submit_candidates).click()
 
+    # Дадим время на редирект/подгрузку, затем явно перейдём на целевую страницу
     time.sleep(2)
     driver.get(TARGET_URL)
     wait.until(EC.presence_of_element_located((By.TAG_NAME, "body")))
