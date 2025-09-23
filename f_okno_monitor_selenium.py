@@ -171,11 +171,17 @@ def format_slots(slots: List[Dict]) -> str:
     )
 
 
+import asyncio  # добавь наверху файла, если ещё нет
+
 def send_tg(text: str):
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
         log.error("TELEGRAM_* не настроены")
         return
-    bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=text)
+    # В PTB v21 методы бота асинхронные — нужно await
+    async def _go():
+        await bot.send_message(chat_id=int(TELEGRAM_CHAT_ID), text=text)
+
+    asyncio.run(_go())
 
 
 def one_check_run():
