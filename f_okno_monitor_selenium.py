@@ -216,15 +216,17 @@ def one_check_run():
         ONLY_WHEN_FREE = os.getenv("ONLY_NOTIFY_WHEN_FREE", "1") == "1"
 
         if snapshot != last:
-            if has_free or not ONLY_WHEN_FREE:
-                text = (
-                    f"[{datetime.now().strftime('%Y-%m-%d %H:%M')}] "
-                    f"Обновление слотов СИЗО-11:\n\n{format_slots(slots)}"
-                )
-                send_tg(text)
-            save_snapshot(snapshot)
-        else:
-            log.info("Без изменений.")
+    if has_free or not ONLY_NOTIFY_WHEN_FREE:
+        text = (
+            f"🚨 Появились свободные слоты в СИЗО-11! "
+            f"[{datetime.now().strftime('%Y-%m-%d %H:%M')}]\n\n"
+            f"{format_slots(slots, only_available=True)}\n\n"
+            f"Записаться тут: <a href='{TARGET_URL}'>страница записи</a>"
+        )
+        send_tg(text)
+        save_snapshot(snapshot)
+    else:
+        log.info("Без изменений.")
     except Exception:
         log.exception("FATAL")
         try:
