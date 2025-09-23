@@ -208,6 +208,14 @@ def one_check_run():
 
         slots = parse_slots_from_html(html)
         has_free = any(s.get("status") == "Свободно" for s in slots)
+        # Печатаем понятный итог проверки в логи GitHub Actions и в run.log
+        free_dates = [(s.get("date") or "").strip() for s in slots if s.get("status") == "Свободно"]
+        if free_dates:
+            log.info("===> Найдены свободные слоты: %d шт.", len(free_dates))
+            for d in free_dates:
+                log.info("FREE_DATE: %s", d)
+        else:
+            log.info("===> Свободных слотов нет.")
 
         snapshot = json.dumps(slots, ensure_ascii=False, sort_keys=True)
         last = load_last_snapshot()
