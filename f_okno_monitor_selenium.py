@@ -195,22 +195,33 @@ def send_tg(text: str):
 
 
 def one_check_run():
-    """Один прогон (для GitHub Actions). Сохраняет page.html/page.png при ошибке."""
+    """Один прогон. Шлём уведомление только если появились свободные даты
+    (или если отключён фильтр ONLY_NOTIFY_WHEN_FREE)."""
     driver = make_driver()
     try:
         login(driver)
         time.sleep(2)
+
         html = driver.page_source
         with open("page.html", "w", encoding="utf-8") as f:
             f.write(html)
 
         slots = parse_slots_from_html(html)
+        has_free = any(s.get("status") == "Свободно" for s in slots)
+
         snapshot = json.dumps(slots, ensure_ascii=False, sort_keys=True)
         last = load_last_snapshot()
 
+        # включено по умолчанию: слать ТОЛЬКО при наличии свободных дат
+        ONLY_WHEN_FREE = os.getenv("ONLY_NOTIFY_WHEN_FREE", "1") == "1"
+
         if snapshot != last:
-            text = f"[{datetime.now().strftime('%Y-%m-%d %H:%M')}] Обновление слотов СИЗО-11:\n\n{format_slots(slots)}"
-            send_tg(text)
+            if has_free or not ONLY_WHEN_FREE:
+                text = (
+                    f"[{datetime.now().strftime('%Y-%m-%d %H:%M')}] "
+                    f"Обновление слотов СИЗО-11:\n\n{format_slots(slots)}"
+                )
+                send_tg(text)
             save_snapshot(snapshot)
         else:
             log.info("Без изменений.")
