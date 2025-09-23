@@ -3,7 +3,7 @@ name: Monitor SIZO-11 slots
 on:
   workflow_dispatch: {}
   schedule:
-    - cron: "*/10 * * * *"
+    - cron: "*/10 * * * *"  # каждые 10 минут
 
 jobs:
   run-monitor:
@@ -26,6 +26,7 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
+      # Основной прогон: весь вывод → run.log, артефакты создаём заранее
       - name: Run monitor (single check)
         id: run
         env:
@@ -36,12 +37,59 @@ jobs:
           TARGET_URL: https://f-okno.ru/base/moscovskaya_oblast/sizo11noginsk
           LOGIN_URL: https://f-okno.ru/login?request_uri=%2Fbase%2Fmoscovskaya_oblast%2Fsizo11noginsk
           CHROME_PATH: ${{ steps.chrome.outputs.chrome-path }}
+        shell: bash
         run: |
-          set -e
-          python f_okno_monitor_selenium.py
-        continue-on-error: true   # не прерываем, чтобы успеть выгрузить артефакты
+          set -euo pipefail
+          export PYTHONUNBUFFERED=1
+          : > run.log
+          : > page.html || true
+          : > page.png  || true
+          echo "Python: $(python -V)" | tee -a run.log
+          echo "Chrome path: ${CHROME_PATH:-<empty>}" | tee -a run.log
+          which python | tee -a run.log
+          # Запуск скрипта, весь stdout+stderr → run.log
+          python f_okno_monitor_selenium.py 2>&1 | tee -a run.log
+          STATUS=${PIPESTATUS[0]}
+          echo "Exit status: $STATUS" | tee -a run.log
+          exit $STATUS
+        continue-on-error: true
 
-      - name: Upload debug artifacts (screenshots, html, logs)
+      # Если основная проверка упала — делаем «дымовую» проверку Chrome+Selenium
+      - name: Smoke test (open login page and screenshot)
+        if: steps.run.outcome == 'failure'
+        env:
+          CHROME_PATH: ${{ steps.chrome.outputs.chrome-path }}
+          LOGIN_URL: https://f-okno.ru/login?request_uri=%2Fbase%2Fmoscovskaya_oblast%2Fsizo11noginsk
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - << 'PY'
+import os, time
+from selenium import webdriver
+from selenium.webdriver.chrome.options import Options
+from webdriver_manager.chrome import ChromeDriverManager
+
+opts = Options()
+opts.add_argument("--headless=new")
+opts.add_argument("--no-sandbox")
+opts.add_argument("--disable-dev-shm-usage")
+opts.add_argument("--window-size=1280,2000")
+if os.getenv("CHROME_PATH"):
+    opts.binary_location = os.getenv("CHROME_PATH")
+drv = webdriver.Chrome(ChromeDriverManager().install(), options=opts)
+try:
+    url = os.getenv("LOGIN_URL")
+    print("Opening:", url)
+    drv.get(url)
+    time.sleep(2)
+    open("page.html","w",encoding="utf-8").write(drv.page_source)
+    drv.save_screenshot("page.png")
+    print("Smoke test OK")
+finally:
+    drv.quit()
+PY
+
+      - name: Upload debug artifacts
         if: always()
         uses: actions/upload-artifact@v4
         with:
