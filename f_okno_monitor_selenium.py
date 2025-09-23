@@ -119,31 +119,27 @@ def login(driver: webdriver.Chrome):
 
 def parse_slots_from_html(html: str) -> List[Dict]:
     soup = BeautifulSoup(html, "lxml")
-
     out: List[Dict] = []
+
     items = soup.select("#graphic_container .graphic_item")
     if not items:
-        # fallback: если верстка поменялась, хотя бы понять есть ли свободно
+        # fallback: хотя бы понять — есть ли где-то «Есть места»
         text = soup.get_text(" ", strip=True)
-        status = "Свободно" if ("Записаться" in text or "Свобод" in text) else "Нет мест"
+        status = "Свободно" if ("Есть места" in text or "Записаться" in text) else "Нет мест"
         return [{"date": "", "time": "", "status": status}]
 
     for item in items:
-        # дата дня
         date_el = item.select_one(".graphic_item_date")
         date_txt = date_el.get_text(" ", strip=True) if date_el else ""
 
-        # статус дня: busy/grey/disabled = нет мест
-        classes = item.get("class", [])
-        if any(c in classes for c in ("busy", "grey", "disabled")):
-            status = "Нет мест"
-        else:
-            # если когда-нибудь появится день со свободными слотами
-            slots_el = item.select_one(".graphic_item_slots")
-            slots_txt = slots_el.get_text(" ", strip=True) if slots_el else ""
-            status = "Свободно" if ("Записаться" in slots_txt or "Свобод" in slots_txt) else "Нет мест"
+        classes = set(item.get("class", []))
+        slots_el = item.select_one(".graphic_item_slots")
+        slots_txt = slots_el.get_text(" ", strip=True) if slots_el else ""
 
-        out.append({"date": date_txt, "time": "", "status": status})
+        # «Свободно», если явно написано «Есть места», или день зелёный
+        is_free = ("Есть места" in slots_txt) or any(c in {"green", "available", "free"} for c in classes)
+
+        out.append({"date": date_txt, "time": "", "status": "Свободно" if is_free else "Нет мест"})
 
     return out
 
@@ -166,24 +162,34 @@ def save_snapshot(s: str):
         log.warning("Не удалось сохранить снапшот: %s", e)
 
 
-def format_slots(slots: List[Dict]) -> str:
+def format_slots(slots: List[Dict], only_available: bool = True) -> str:
     if not slots:
-        return "Слотов не найдено."
-    return "\n".join(
-        f"- {(s.get('date') or '')} {(s.get('time') or '')} — {(s.get('status') or '')}".strip()
-        for s in slots
-    )
+        return "Свободных дат нет."
+
+    # берём только свободные, если включено
+    filtered = [s for s in slots if (s.get("status") == "Свободно")] if only_available else slots
+    if not filtered:
+        return "Свободных дат нет."
+
+    lines = []
+    for s in filtered:
+        d = (s.get("date") or "").strip()
+        # ✅ и жирным — заметный алерт
+        lines.append(f"✅ <b>{d}</b>")
+    return "\n".join(lines)
 
 
-import asyncio  # добавь наверху файла, если ещё нет
+import asyncio  # убедись, что импорт есть вверху
 
 def send_tg(text: str):
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
         log.error("TELEGRAM_* не настроены")
         return
-    # В PTB v21 методы бота асинхронные — нужно await
+
     async def _go():
-        await bot.send_message(chat_id=int(TELEGRAM_CHAT_ID), text=text)
+        chat = TELEGRAM_CHAT_ID.strip()
+        chat_id = chat if chat.startswith("@") else int(chat)
+        await bot.send_message(chat_id=chat_id, text=text, parse_mode="HTML")
 
     asyncio.run(_go())
 
