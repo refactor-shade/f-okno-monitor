@@ -31,6 +31,10 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(me
 log = logging.getLogger("f-okno-selenium")
 bot = Bot(token=TELEGRAM_TOKEN)
 
+fh = logging.FileHandler("run.log", encoding="utf-8")
+fh.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
+log.addHandler(fh)
+
 def make_driver() -> webdriver.Chrome:
     chrome_options = Options()
     chrome_options.add_argument("--headless=new")
@@ -41,13 +45,9 @@ def make_driver() -> webdriver.Chrome:
         "--user-agent=Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
         "(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
     )
-
-    # ВАЖНО: GitHub Actions даёт переменную CHROME_PATH
     chrome_binary = os.getenv("CHROME_PATH")
     if chrome_binary:
         chrome_options.binary_location = chrome_binary
-
-    # webdriver-manager скачает совместимый chromedriver сам
     from webdriver_manager.chrome import ChromeDriverManager
     drv = webdriver.Chrome(ChromeDriverManager().install(), options=chrome_options)
     drv.set_page_load_timeout(60)
@@ -129,12 +129,13 @@ def send_tg(text: str):
     bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=text)
 
 def one_check_run():
-    """Одна проверка (для GitHub Actions)."""
     driver = make_driver()
     try:
         login(driver)
         time.sleep(2)
         html = driver.page_source
+        with open("page.html", "w", encoding="utf-8") as f:
+            f.write(html)
         slots = parse_slots_from_html(html)
 
         snapshot = json.dumps(slots, ensure_ascii=False, sort_keys=True)
@@ -144,7 +145,16 @@ def one_check_run():
             send_tg(text)
             save_snapshot(snapshot)
         else:
-            logging.info("Без изменений.")
+            log.info("Без изменений.")
+    except Exception as e:
+        log.exception("FATAL")
+        try:
+            driver.save_screenshot("page.png")
+            with open("page.html", "w", encoding="utf-8") as f:
+                f.write(driver.page_source)
+        except Exception:
+            pass
+        raise
     finally:
         driver.quit()
 
