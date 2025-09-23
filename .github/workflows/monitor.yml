@@ -18,17 +18,19 @@ jobs:
         with:
           python-version: "3.11"
 
-      # Ставим Chrome и получаем путь в outputs.chrome-path
+      # Ставим STABLE Chrome, чтобы версия совпадала с chromedriver
       - name: Install Chrome
         id: chrome
         uses: browser-actions/setup-chrome@v1
+        with:
+          chrome-version: stable
 
       - name: Install Python deps
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      # Основной прогон (пишем stdout+stderr в run.log)
+      # Основной прогон; пишем stdout+stderr в run.log, сохраняем HTML/PNG при фейле
       - name: Run monitor (single check)
         id: run
         shell: bash
@@ -54,7 +56,7 @@ jobs:
           exit $code
         continue-on-error: true
 
-      # Если основной шаг упал — делаем smoke-test, чтобы получить HTML/скрин
+      # Если основной шаг упал — делаем дымовой тест, чтобы всё равно получить HTML/скрин
       - name: Smoke test (screenshot login page)
         if: steps.run.outcome == 'failure'
         shell: bash
