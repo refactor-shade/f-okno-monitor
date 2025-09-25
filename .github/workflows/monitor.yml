@@ -8,11 +8,12 @@ on:
 
 concurrency:
   group: monitor-sizo11
-  cancel-in-progress: true      # новый запуск отменяет висящий предыдущий
+  cancel-in-progress: true
 
 jobs:
   run-monitor:
     runs-on: ubuntu-latest
+    timeout-minutes: 8
 
     steps:
       - name: Checkout
@@ -22,8 +23,9 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+          cache: "pip"
+          cache-dependency-path: "requirements.txt"
 
-      # STABLE Chrome, чтобы версия совпадала с chromedriver
       - name: Install Chrome
         id: chrome
         uses: browser-actions/setup-chrome@v1
@@ -51,38 +53,10 @@ jobs:
           set -euo pipefail
           export PYTHONUNBUFFERED=1
           : > run.log
-          : > page.html || true
-          : > page.png  || true
           python f_okno_monitor_selenium.py 2>&1 | tee -a run.log
           exit ${PIPESTATUS[0]}
 
-      # Если основной шаг упадёт — сделаем скрин/HTML для отладки
-      - name: Smoke test (screenshot login page)
-        if: failure()
-        shell: bash
-        env:
-          CHROME_PATH: ${{ steps.chrome.outputs.chrome-path }}
-          LOGIN_URL: https://f-okno.ru/login?request_uri=%2Fbase%2Fmoscovskaya_oblast%2Fsizo11noginsk
-        run: |
-          set -euo pipefail
-          python - <<'PY'
-          import os, time
-          from selenium import webdriver
-          from selenium.webdriver.chrome.options import Options
-          opts = Options()
-          opts.add_argument("--headless=new")
-          opts.add_argument("--no-sandbox")
-          opts.add_argument("--disable-dev-shm-usage")
-          opts.binary_location = os.environ["CHROME_PATH"]
-          drv = webdriver.Chrome(options=opts)
-          drv.get(os.environ["LOGIN_URL"])
-          time.sleep(1)
-          drv.save_screenshot("page.png")
-          with open("page.html","w",encoding="utf-8") as f: f.write(drv.page_source)
-          drv.quit()
-          PY
-
-      - name: Upload debug artifacts
+      - name: Upload debug artifacts (on failure)
         if: failure()
         uses: actions/upload-artifact@v4
         with:
@@ -91,7 +65,3 @@ jobs:
             run.log
             page.html
             page.png
-
-      - name: Fail if script failed
-        if: failure()
-        run: exit 1
