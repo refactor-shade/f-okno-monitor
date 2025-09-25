@@ -3,6 +3,7 @@ import time
 import json
 import logging
 from datetime import datetime
+from zoneinfo import ZoneInfo
 from typing import List, Dict
 
 from dotenv import load_dotenv
@@ -225,9 +226,10 @@ def one_check_run():
 
         if snapshot != last:
             if has_free or not ONLY_NOTIFY_WHEN_FREE:
+                ts = datetime.now(ZoneInfo("Europe/Moscow")).strftime('%Y-%m-%d %H:%M')
                 text = (
                     f"🚨 Появились свободные слоты в СИЗО-11! "
-                    f"[{datetime.now().strftime('%Y-%m-%d %H:%M')}]\n\n"
+                    f"[{ts}]\n\n"
                     f"{format_slots(slots, only_available=True)}\n\n"
                     f"Записаться тут: <a href='{TARGET_URL}'>страница записи</a>"
                 )
