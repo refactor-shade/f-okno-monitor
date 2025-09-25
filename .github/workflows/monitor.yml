@@ -3,7 +3,12 @@ name: Monitor SIZO-11 slots
 on:
   workflow_dispatch: {}
   schedule:
-    - cron: "*/10 * * * *"   # каждые 10 минут (UTC)
+    - cron: "*/10 * * * *"      # :00, :10, :20, :30, :40, :50 (UTC)
+    - cron: "5-59/10 * * * *"   # :05, :15, :25, :35, :45, :55 (UTC) — смещение на 5 минут
+
+concurrency:
+  group: monitor-sizo11
+  cancel-in-progress: true      # новый запуск отменяет висящий предыдущий
 
 jobs:
   run-monitor:
