@@ -1,5 +1,4 @@
-selenium==4.23.1
-python-telegram-bot==21.4
-python-dotenv==1.0.1
-beautifulsoup4==4.12.3
-lxml==5.3.0
+selenium>=4.12
+beautifulsoup4>=4.12
+python-dotenv>=1.0
+requests>=2.31
