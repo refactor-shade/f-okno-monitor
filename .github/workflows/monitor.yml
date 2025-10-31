@@ -1,17 +1,10 @@
 name: Monitor SIZO-11 slots
 
 on:
+  workflow_dispatch: {}
   schedule:
-    - cron: "*/7 * * * *"    # каждые 7 минут (UTC)
-  workflow_dispatch:
-
-# чтобы не запускалось параллельно и не мешало снапшоту
-concurrency:
-  group: monitor-sizo11
-  cancel-in-progress: true
-
-permissions:
-  contents: read
+    # каждые 7 минут
+    - cron: "*/7 * * * *"
 
 jobs:
   run-monitor:
@@ -26,54 +19,33 @@ jobs:
         with:
           python-version: "3.11"
 
-      # Ставим STABLE Chrome, чтобы Selenium Manager подобрал совместимый драйвер
-      - name: Install Chrome
-        id: chrome
+      # Ставим стабильный Chrome
+      - name: Install Chrome (stable)
         uses: browser-actions/setup-chrome@v1
         with:
           chrome-version: stable
 
-      - name: Export Chrome path
-        # важно: прокидываем путь к бинарнику в ENV для скрипта
-        run: echo "CHROME_PATH=${{ steps.chrome.outputs.chrome-path }}" >> $GITHUB_ENV
+      # Удаляем системный chromedriver, чтобы не мешал Selenium Manager
+      - name: Remove preinstalled chromedriver
+        run: sudo rm -f /usr/bin/chromedriver || true
 
       - name: Install Python deps
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Print versions (debug)
-        run: |
-          echo "Chrome path: $CHROME_PATH"
-          "$CHROME_PATH" --version || true
-          python - << 'PY'
-          import selenium
-          print("Selenium:", selenium.__version__)
-          PY
-
       - name: Run monitor (single check)
         env:
-          # обязательные ENV
-          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          # важные переменные
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-
-          # опциональные ENV (можно менять при надобности)
-          LOGIN_URL: "https://f-okno.ru/login?request_uri=%2Fbase%2Fmoscovskaya_oblast%2Fsizo11noginsk"
+          # адреса целевой страницы (Ногинск) и логина
           TARGET_URL: "https://f-okno.ru/base/moscovskaya_oblast/sizo11noginsk"
+          LOGIN_URL: "https://f-okno.ru/login?request_uri=%2Fbase%2Fmoscovskaya_oblast%2Fsizo11noginsk"
+          # отправлять только если есть свободные слоты (1 = да, 0 = всегда)
           ONLY_NOTIFY_WHEN_FREE: "1"
-          STATE_FILE: "state_sizo11.json"
-
-          # если хочешь, чтобы флеки сайта не краснили job — поставь "0"
-          FAIL_ON_ERROR: "1"
+          # чтобы Selenium Manager не брал драйвер из PATH
+          SE_MANAGER_USE_PATH: "0"
+          # локальное время в логах/уведомлениях
+          TZ: Europe/Moscow
         run: python f_okno_monitor_selenium.py
-
-      - name: Upload debug artifacts
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: debug
-          path: |
-            page.html
-            page.png
-            run.log
-            state_sizo11.json
