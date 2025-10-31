@@ -1,224 +1,237 @@
-import os
-import time
-import json
-import logging
-from datetime import datetime
-from zoneinfo import ZoneInfo
-from typing import List, Dict
+# -*- coding: utf-8 -*-
+"""
+Монитор слотов Ф-ОКНО (СИЗО-11 Ногинск).
+- Без webdriver_manager: подбор chromedriver делает Selenium Manager.
+- Время в сообщениях — по Москве (Europe/Moscow).
+- Сообщение шлётся только при появлении новых свободных дат
+  (или при отключении фильтра ONLY_NOTIFY_WHEN_FREE=0).
+- Снапшот в STATE_FILE предотвращает дубли.
+- Артефакты page.html/page.png сохраняются при падении для диагностики.
+"""
 
-from dotenv import load_dotenv
+from __future__ import annotations
+
+import os
+import json
+import time
+import logging
+from typing import List, Dict
+from datetime import datetime
+
+from zoneinfo import ZoneInfo
 from bs4 import BeautifulSoup
 
 from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.chrome.service import Service
-import os
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC  # noqa: F401
+from selenium.webdriver.common.by import By
+from selenium.common.exceptions import TimeoutException
 
-from telegram import Bot
+import requests
 
-# .env полезен для локального запуска; на GitHub Actions переменные идут из secrets
-load_dotenv()
 
-# ==== Конфиг из окружения ====
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
-EMAIL = os.getenv("F_OKNO_EMAIL")
-PASSWORD = os.getenv("F_OKNO_PASSWORD")
+# -------------------------- Конфигурация из ENV ---------------------------
 
 LOGIN_URL = os.getenv(
     "LOGIN_URL",
     "https://f-okno.ru/login?request_uri=%2Fbase%2Fmoscovskaya_oblast%2Fsizo11noginsk",
 )
+
 TARGET_URL = os.getenv(
     "TARGET_URL",
     "https://f-okno.ru/base/moscovskaya_oblast/sizo11noginsk",
 )
+
 STATE_FILE = os.getenv("STATE_FILE", "state_sizo11.json")
 
-# периодичность в Actions задаёт cron, но оставим дефолт для локального цикла
-CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL_MIN", "3")) * 60
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")  # канал/чат/юзер id
 
-# ==== Логирование ====
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
-log = logging.getLogger("f-okno-selenium")
-# файл-лог для артефактов в Actions
-try:
-    fh = logging.FileHandler("run.log", encoding="utf-8")
-    fh.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
-    log.addHandler(fh)
-except Exception:
-    pass
+ONLY_NOTIFY_WHEN_FREE = os.getenv("ONLY_NOTIFY_WHEN_FREE", "1") == "1"
 
-bot = Bot(token=TELEGRAM_TOKEN)
+# лог в файл — его GitHub Actions поднимает артефактом
+logging.basicConfig(
+    filename="run.log",
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+)
+log = logging.getLogger(__name__)
 
 
-from selenium import webdriver
-from selenium.webdriver.chrome.options import Options
-from selenium.webdriver.chrome.service import Service
-from webdriver_manager.chrome import ChromeDriverManager  # как и было
+# --------------------------- Утилиты и I/O --------------------------------
+
+def load_last_snapshot() -> str:
+    try:
+        with open(STATE_FILE, "r", encoding="utf-8") as f:
+            return f.read()
+    except FileNotFoundError:
+        return ""
 
 
-from selenium import webdriver
-from selenium.webdriver.chrome.options import Options
-from selenium.webdriver.chrome.service import Service
-import os
+def save_snapshot(s: str) -> None:
+    with open(STATE_FILE, "w", encoding="utf-8") as f:
+        f.write(s)
 
-def make_driver():
+
+def send_tg(text: str, parse_mode: str = "HTML") -> None:
+    if not (TELEGRAM_TOKEN and TELEGRAM_CHAT_ID):
+        log.info("TELEGRAM creds not set — skipping send.")
+        return
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+    data = {"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode": parse_mode, "disable_web_page_preview": True}
+    try:
+        r = requests.post(url, data=data, timeout=20)
+        if r.status_code != 200:
+            log.warning("Telegram send failed: %s %s", r.status_code, r.text)
+    except Exception:
+        log.exception("Telegram send fatal")
+
+
+# ------------------------------ WebDriver ---------------------------------
+
+def make_driver() -> webdriver.Chrome:
+    """
+    Создаёт Chrome, полагаясь на Selenium Manager для подбора chromedriver.
+    Если в ENV есть CHROME_PATH (прокинутый из workflow), используем его.
+    """
     opts = Options()
     opts.add_argument("--headless=new")
     opts.add_argument("--no-sandbox")
     opts.add_argument("--disable-dev-shm-usage")
-    opts.add_argument("--window-size=1280,2000")
+    opts.add_argument("--window-size=1280,2200")
 
-    # Экшен setup-chrome дал путь к бинарнику Chromium
     chrome_path = os.getenv("CHROME_PATH") or os.getenv("CHROME_BIN")
     if chrome_path:
         opts.binary_location = chrome_path
 
-    # КЛЮЧЕВОЕ: не указывать executable_path — Selenium Manager сам подберёт chromedriver
+    # Service() без executable_path → Selenium Manager сам подберет драйвер
     service = Service()
+    drv = webdriver.Chrome(service=service, options=opts)
+    drv.set_page_load_timeout(60)
+    return drv
 
-    driver = webdriver.Chrome(service=service, options=opts)
-    driver.set_page_load_timeout(60)
-    return driver
 
-def login(driver: webdriver.Chrome):
-    log.info("Открываю страницу логина…")
-    driver.get(LOGIN_URL)
-    wait = WebDriverWait(driver, 20)
+def safe_get(driver: webdriver.Chrome, url: str, wait_css: str | None = None, timeout: int = 30) -> None:
+    driver.get(url)
+    if wait_css:
+        try:
+            WebDriverWait(driver, timeout).until(
+                EC.presence_of_element_located((By.CSS_SELECTOR, wait_css))
+            )
+        except TimeoutException:
+            # не критично — сохранимся и продолжим
+            log.warning("Timeout waiting for %s on %s", wait_css, url)
 
-    # Правильные селекторы для f-okno (заменили email->login, password->pass)
-    email_candidates = [
-        (By.NAME, "login"),
-        (By.CSS_SELECTOR, "input[name='login']"),
-    ]
-    pwd_candidates = [
-        (By.NAME, "pass"),
-        (By.CSS_SELECTOR, "input[name='pass']"),
-    ]
-    submit_candidates = [
-        (By.CSS_SELECTOR, "#login_form .pre_button"),
-        (By.XPATH, "//a[contains(.,'Авторизоваться')]"),
-    ]
 
-    def find_first(cands):
-        for how, what in cands:
-            try:
-                return wait.until(EC.presence_of_element_located((how, what)))
-            except Exception:
-                continue
-        raise RuntimeError(f"Элемент не найден. Проверь селекторы: {cands}")
+def login(driver: webdriver.Chrome) -> None:
+    """
+    Лёгкий «логин»: открываем LOGIN_URL (чтобы получить правильные куки),
+    затем целевую страницу TARGET_URL.
+    Если у тебя есть реальный логин/пароль — можно дописать ввод в поля.
+    """
+    # 1. открыли login
+    safe_get(driver, LOGIN_URL)
+    time.sleep(1.5)
+    # 2. на целевую страницу
+    safe_get(driver, TARGET_URL)
+    # немного воздуха, чтобы прогрузилась вёрстка
+    time.sleep(1.0)
 
-    # Находим поля и вводим учётки
-    email_input = find_first(email_candidates)
-    pwd_input = find_first(pwd_candidates)
-    email_input.clear(); email_input.send_keys(EMAIL)
-    pwd_input.clear();   pwd_input.send_keys(PASSWORD)
 
-    # Нажимаем кнопку авторизации (это <a ... onclick="doForm('login_form')">)
-    find_first(submit_candidates).click()
-
-    # Дадим время на редирект/подгрузку, затем явно перейдём на целевую страницу
-    time.sleep(2)
-    driver.get(TARGET_URL)
-    wait.until(EC.presence_of_element_located((By.TAG_NAME, "body")))
-    log.info("Логин завершён, целевая страница открыта.")
+# ------------------------------ Парсинг -----------------------------------
 
 def parse_slots_from_html(html: str) -> List[Dict]:
+    """
+    Возвращает список dict: {"date": "...", "status": "Свободно"/"..."}
+    Парсинг максимально терпимый к вёрстке: ищем карточки дней и текстовые индикаторы.
+    """
     soup = BeautifulSoup(html, "lxml")
-    out: List[Dict] = []
+    slots: List[Dict] = []
 
-    items = soup.select("#graphic_container .graphic_item")
-    if not items:
-        # fallback: хотя бы понять — есть ли где-то «Есть места»
-        text = soup.get_text(" ", strip=True)
-        status = "Свободно" if ("Есть места" in text or "Записаться" in text) else "Нет мест"
-        return [{"date": "", "time": "", "status": status}]
+    # 1) Частый вариант — «плитки» дней/календарь
+    day_nodes = soup.select(".day, .calendar-day, .slot, .slots-list .slot, .calendar .day")
+    if day_nodes:
+        for n in day_nodes:
+            text = n.get_text(" ", strip=True)
+            if not text:
+                continue
+            # дата — первые слова/цифры до статуса
+            # часто встречаются "16 октября четверг Есть места" / "Свободных мест нет"
+            status = "Свободно" if ("Есть места" in text or "Записаться" in text or "Свободны" in text) else ""
+            date_part = text
+            # немного подчистим агрессивные хвосты
+            for marker in ["Есть места", "Свободных мест нет", "мест нет", "Записаться"]:
+                date_part = date_part.replace(marker, "").strip()
+            if status:
+                slots.append({"date": date_part, "status": status})
+            else:
+                # оставим для полноты картины (будет отфильтровано дальше)
+                slots.append({"date": date_part, "status": "Нет мест"})
+        return slots
 
-    for item in items:
-        date_el = item.select_one(".graphic_item_date")
-        date_txt = date_el.get_text(" ", strip=True) if date_el else ""
+    # 2) Фоллбек — просто текстовая проверка всей страницы
+    text = soup.get_text("\n", strip=True)
+    if "Есть места" in text or "Записаться" in text:
+        slots.append({"date": "", "status": "Свободно"})
+    else:
+        slots.append({"date": "", "status": "Нет мест"})
 
-        classes = set(item.get("class", []))
-        slots_el = item.select_one(".graphic_item_slots")
-        slots_txt = slots_el.get_text(" ", strip=True) if slots_el else ""
-
-        # «Свободно», если явно написано «Есть места», или день зелёный
-        is_free = ("Есть места" in slots_txt) or any(c in {"green", "available", "free"} for c in classes)
-
-        out.append({"date": date_txt, "time": "", "status": "Свободно" if is_free else "Нет мест"})
-
-    return out
-
-
-def load_last_snapshot() -> str:
-    if not os.path.exists(STATE_FILE):
-        return ""
-    try:
-        with open(STATE_FILE, "r", encoding="utf-8") as f:
-            return f.read()
-    except Exception:
-        return ""
+    return slots
 
 
-def save_snapshot(s: str):
-    try:
-        with open(STATE_FILE, "w", encoding="utf-8") as f:
-            f.write(s)
-    except Exception as e:
-        log.warning("Не удалось сохранить снапшот: %s", e)
-
+# --------------------------- Форматирование -------------------------------
 
 def format_slots(slots: List[Dict], only_available: bool = True) -> str:
+    """
+    Возвращает список строк вида:
+      ✅ <b>16 октября четверг</b>
+    Если свободных нет — «Свободных дат нет.»
+    """
     if not slots:
         return "Свободных дат нет."
 
-    # берём только свободные, если включено
-    filtered = [s for s in slots if (s.get("status") == "Свободно")] if only_available else slots
+    filtered = [s for s in slots if s.get("status") == "Свободно"] if only_available else slots
     if not filtered:
         return "Свободных дат нет."
 
     lines = []
     for s in filtered:
-        d = (s.get("date") or "").strip()
-        # ✅ и жирным — заметный алерт
+        d = (s.get("date") or "").strip() or "Свободно"
         lines.append(f"✅ <b>{d}</b>")
     return "\n".join(lines)
 
 
-import asyncio  # убедись, что импорт есть вверху
+# ------------------------------ Основной прогон ---------------------------
 
-def send_tg(text: str):
-    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
-        log.error("TELEGRAM_* не настроены")
-        return
+def one_check_run() -> None:
+    """
+    Один прогон мониторинга:
+      - грузим страницу
+      - парсим свободные даты
+      - сравниваем со снапшотом
+      - шлём Telegram (фильтр по ONLY_NOTIFY_WHEN_FREE)
+    """
+    # фиксируем московское время один раз для сообщения/логов
+    ts_msk = datetime.now(ZoneInfo("Europe/Moscow")).strftime("%Y-%m-%d %H:%M")
 
-    async def _go():
-        chat = TELEGRAM_CHAT_ID.strip()
-        chat_id = chat if chat.startswith("@") else int(chat)
-        await bot.send_message(chat_id=chat_id, text=text, parse_mode="HTML")
-
-    asyncio.run(_go())
-
-
-def one_check_run():
-    """Один прогон. Шлём уведомление только если появились свободные даты
-    (или если отключён фильтр ONLY_NOTIFY_WHEN_FREE)."""
     driver = make_driver()
     try:
         login(driver)
-        time.sleep(2)
 
         html = driver.page_source
+        # сохраняем как артефакт на всякий случай
         with open("page.html", "w", encoding="utf-8") as f:
             f.write(html)
 
         slots = parse_slots_from_html(html)
         has_free = any(s.get("status") == "Свободно" for s in slots)
-        # Печатаем понятный итог проверки в логи GitHub Actions и в run.log
+
+        # лог: что нашли
         free_dates = [(s.get("date") or "").strip() for s in slots if s.get("status") == "Свободно"]
         if free_dates:
-            log.info("===> Найдены свободные слоты: %d шт.", len(free_dates))
+            log.info("===> Найдены свободные слоты: %d", len(free_dates))
             for d in free_dates:
                 log.info("FREE_DATE: %s", d)
         else:
@@ -227,27 +240,24 @@ def one_check_run():
         snapshot = json.dumps(slots, ensure_ascii=False, sort_keys=True)
         last = load_last_snapshot()
 
-        # включено по умолчанию: слать ТОЛЬКО при наличии свободных дат
-        ONLY_NOTIFY_WHEN_FREE = os.getenv("ONLY_NOTIFY_WHEN_FREE", "1") == "1"
-
         if snapshot != last:
             if has_free or not ONLY_NOTIFY_WHEN_FREE:
-                ts = datetime.now(ZoneInfo("Europe/Moscow")).strftime('%Y-%m-%d %H:%M')
                 text = (
                     f"🚨 Появились свободные слоты в СИЗО-11! "
-                    f"[{ts}]\n\n"
+                    f"[{ts_msk}]\n\n"
                     f"{format_slots(slots, only_available=True)}\n\n"
                     f"Записаться тут: <a href='{TARGET_URL}'>страница записи</a>"
                 )
                 send_tg(text)
-            # Сохраняем снимок ВСЕГДА, если он изменился — чтобы не слать дубликаты
+            # снапшот сохраняем всегда при изменении
             save_snapshot(snapshot)
         else:
-            log.info("Без изменений.")
+            log.info("Без изменений (snapshot match).")
 
     except Exception:
         log.exception("FATAL")
         try:
+            # скрин / html на артефакты
             driver.save_screenshot("page.png")
             with open("page.html", "w", encoding="utf-8") as f:
                 f.write(driver.page_source)
@@ -258,8 +268,11 @@ def one_check_run():
         driver.quit()
 
 
+# --------------------------------- main -----------------------------------
+
 if __name__ == "__main__":
-    # В Actions нужен один прогон
-    one_check_run()
-    # Для локального кручения по кругу можно заменить на цикл:
-    # while True: one_check_run(); time.sleep(CHECK_INTERVAL)
+    log.info("=== RUN START (MSK %s) ===", datetime.now(ZoneInfo("Europe/Moscow")).strftime("%Y-%m-%d %H:%M:%S"))
+    try:
+        one_check_run()
+    finally:
+        log.info("=== RUN END ===")
