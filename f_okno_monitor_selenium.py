@@ -1,12 +1,14 @@
 # -*- coding: utf-8 -*-
 """
 Монитор слотов Ф-ОКНО (СИЗО-11 Ногинск).
+
+Особенности:
 - Без webdriver_manager: подбор chromedriver делает Selenium Manager.
 - Время в сообщениях — по Москве (Europe/Moscow).
 - Сообщение шлётся только при появлении новых свободных дат
   (или при отключении фильтра ONLY_NOTIFY_WHEN_FREE=0).
 - Снапшот в STATE_FILE предотвращает дубли.
-- Артефакты page.html/page.png сохраняются при падении для диагностики.
+- Артефакты page.html/page.png/run.log сохраняются для диагностики.
 """
 
 from __future__ import annotations
@@ -47,11 +49,13 @@ TARGET_URL = os.getenv(
 STATE_FILE = os.getenv("STATE_FILE", "state_sizo11.json")
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")  # канал/чат/юзер id
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")  # id чата/канала/пользователя
 
+# По умолчанию шлём только если есть свободные даты
 ONLY_NOTIFY_WHEN_FREE = os.getenv("ONLY_NOTIFY_WHEN_FREE", "1") == "1"
 
-# лог в файл — его GitHub Actions поднимает артефактом
+
+# Лог в файл — GitHub Actions поднимет артефактом
 logging.basicConfig(
     filename="run.log",
     level=logging.INFO,
@@ -80,7 +84,12 @@ def send_tg(text: str, parse_mode: str = "HTML") -> None:
         log.info("TELEGRAM creds not set — skipping send.")
         return
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    data = {"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode": parse_mode, "disable_web_page_preview": True}
+    data = {
+        "chat_id": TELEGRAM_CHAT_ID,
+        "text": text,
+        "parse_mode": parse_mode,
+        "disable_web_page_preview": True,
+    }
     try:
         r = requests.post(url, data=data, timeout=20)
         if r.status_code != 200:
@@ -106,7 +115,7 @@ def make_driver() -> webdriver.Chrome:
     if chrome_path:
         opts.binary_location = chrome_path
 
-    # Service() без executable_path → Selenium Manager сам подберет драйвер
+    # Service() без executable_path → Selenium Manager сам подберёт драйвер
     service = Service()
     drv = webdriver.Chrome(service=service, options=opts)
     drv.set_page_load_timeout(60)
@@ -121,7 +130,6 @@ def safe_get(driver: webdriver.Chrome, url: str, wait_css: str | None = None, ti
                 EC.presence_of_element_located((By.CSS_SELECTOR, wait_css))
             )
         except TimeoutException:
-            # не критично — сохранимся и продолжим
             log.warning("Timeout waiting for %s on %s", wait_css, url)
 
 
@@ -129,14 +137,11 @@ def login(driver: webdriver.Chrome) -> None:
     """
     Лёгкий «логин»: открываем LOGIN_URL (чтобы получить правильные куки),
     затем целевую страницу TARGET_URL.
-    Если у тебя есть реальный логин/пароль — можно дописать ввод в поля.
+    Если есть реальный логин/пароль — можно дописать ввод в поля.
     """
-    # 1. открыли login
     safe_get(driver, LOGIN_URL)
     time.sleep(1.5)
-    # 2. на целевую страницу
     safe_get(driver, TARGET_URL)
-    # немного воздуха, чтобы прогрузилась вёрстка
     time.sleep(1.0)
 
 
@@ -144,8 +149,8 @@ def login(driver: webdriver.Chrome) -> None:
 
 def parse_slots_from_html(html: str) -> List[Dict]:
     """
-    Возвращает список dict: {"date": "...", "status": "Свободно"/"..."}
-    Парсинг максимально терпимый к вёрстке: ищем карточки дней и текстовые индикаторы.
+    Возвращает список dict: {"date": "...", "status": "Свободно"/"..."}.
+    Парсинг терпим к вёрстке: ищем карточки дней и текстовые индикаторы.
     """
     soup = BeautifulSoup(html, "lxml")
     slots: List[Dict] = []
@@ -157,17 +162,13 @@ def parse_slots_from_html(html: str) -> List[Dict]:
             text = n.get_text(" ", strip=True)
             if not text:
                 continue
-            # дата — первые слова/цифры до статуса
-            # часто встречаются "16 октября четверг Есть места" / "Свободных мест нет"
-            status = "Свободно" if ("Есть места" in text or "Записаться" in text or "Свободны" in text) else ""
+            status = "Свободно" if ("Есть места" in text or "Записаться" in text or "Свободн" in text) else ""
             date_part = text
-            # немного подчистим агрессивные хвосты
             for marker in ["Есть места", "Свободных мест нет", "мест нет", "Записаться"]:
                 date_part = date_part.replace(marker, "").strip()
             if status:
                 slots.append({"date": date_part, "status": status})
             else:
-                # оставим для полноты картины (будет отфильтровано дальше)
                 slots.append({"date": date_part, "status": "Нет мест"})
         return slots
 
@@ -213,7 +214,6 @@ def one_check_run() -> None:
       - сравниваем со снапшотом
       - шлём Telegram (фильтр по ONLY_NOTIFY_WHEN_FREE)
     """
-    # фиксируем московское время один раз для сообщения/логов
     ts_msk = datetime.now(ZoneInfo("Europe/Moscow")).strftime("%Y-%m-%d %H:%M")
 
     driver = make_driver()
@@ -221,7 +221,6 @@ def one_check_run() -> None:
         login(driver)
 
         html = driver.page_source
-        # сохраняем как артефакт на всякий случай
         with open("page.html", "w", encoding="utf-8") as f:
             f.write(html)
 
@@ -257,7 +256,6 @@ def one_check_run() -> None:
     except Exception:
         log.exception("FATAL")
         try:
-            # скрин / html на артефакты
             driver.save_screenshot("page.png")
             with open("page.html", "w", encoding="utf-8") as f:
                 f.write(driver.page_source)
@@ -272,7 +270,13 @@ def one_check_run() -> None:
 
 if __name__ == "__main__":
     log.info("=== RUN START (MSK %s) ===", datetime.now(ZoneInfo("Europe/Moscow")).strftime("%Y-%m-%d %H:%M:%S"))
+    fail_on_error = os.getenv("FAIL_ON_ERROR", "1") == "1"
     try:
         one_check_run()
+    except Exception:
+        if fail_on_error:
+            raise
+        else:
+            log.exception("Suppressed failure (FAIL_ON_ERROR=0)")
     finally:
         log.info("=== RUN END ===")
