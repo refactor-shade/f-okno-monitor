@@ -61,27 +61,29 @@ from selenium.webdriver.chrome.service import Service
 from webdriver_manager.chrome import ChromeDriverManager  # как и было
 
 
-def make_driver() -> webdriver.Chrome:
+from selenium import webdriver
+from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.chrome.service import Service
+import os
+
+def make_driver():
     opts = Options()
     opts.add_argument("--headless=new")
     opts.add_argument("--no-sandbox")
     opts.add_argument("--disable-dev-shm-usage")
-    opts.add_argument("--disable-gpu")
-    opts.add_argument("--blink-settings=imagesEnabled=false")  # быстрее: без картинок
     opts.add_argument("--window-size=1280,2000")
-    # Если Actions прокинул путь к браузеру:
-    if os.getenv("CHROME_PATH"):
-        opts.binary_location = os.getenv("CHROME_PATH")
 
-    # Чуть агрессивнее загружаем страницу (не ждём все ресурсы)
-    opts.page_load_strategy = "eager"
+    # Экшен setup-chrome дал путь к бинарнику Chromium
+    chrome_path = os.getenv("CHROME_PATH") or os.getenv("CHROME_BIN")
+    if chrome_path:
+        opts.binary_location = chrome_path
 
-    # Остаёмся на привычной схеме с webdriver_manager (безопасно)
-    service = Service(ChromeDriverManager().install())
-    drv = webdriver.Chrome(service=service, options=opts)
-    drv.set_page_load_timeout(15)
-    return drv
+    # КЛЮЧЕВОЕ: не указывать executable_path — Selenium Manager сам подберёт chromedriver
+    service = Service()
 
+    driver = webdriver.Chrome(service=service, options=opts)
+    driver.set_page_load_timeout(60)
+    return driver
 
 def login(driver: webdriver.Chrome):
     log.info("Открываю страницу логина…")
