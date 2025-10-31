@@ -26,10 +26,13 @@ jobs:
           cache-dependency-path: "requirements.txt"
 
       - name: Install Chrome
-        id: chrome
-        uses: browser-actions/setup-chrome@v1
-        with:
-          chrome-version: "140"
+          id: chrome
+          uses: browser-actions/setup-chrome@v1
+          with:
+            chrome-version: stable   # можно и 140, но stable тоже ок
+      
+      - name: Export Chrome path
+          run: echo "CHROME_PATH=${{ steps.chrome.outputs.chrome-path }}" >> $GITHUB_ENV
 
       - name: Install Python deps
         run: |
