@@ -34,6 +34,7 @@ jobs:
       - name: Export Chrome path
           run: echo "CHROME_PATH=${{ steps.chrome.outputs.chrome-path }}" >> $GITHUB_ENV
 
+
       - name: Install Python deps
         run: |
           python -m pip install --upgrade pip
