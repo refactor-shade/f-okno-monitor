@@ -126,65 +126,69 @@ def login(driver: webdriver.Chrome) -> None:
 
 # ---------- парсинг HTML ----------
 def parse_slots_from_html(html: str) -> List[Dict]:
-    """
-    Универсальный парсер. Ищет карточки дат и их статусы.
+    import re
+from typing import List, Dict
+from bs4 import BeautifulSoup
 
+_MONTHS = (
+    "января|февраля|марта|апреля|мая|июня|июля|августа|сентября|октября|ноября|декабря"
+)
+_WEEKDAYS = "понедельник|вторник|среда|четверг|пятница|суббота|воскресенье"
+_DATE_RE = re.compile(rf"\b(\d{{1,2}})\s+({_MONTHS})(?:\s+({_WEEKDAYS}))?\b", re.IGNORECASE)
+
+def parse_slots_from_html(html: str) -> List[Dict]:
+    """
     Возвращает список:
-    [{"date": "16 октября четверг", "status": "Свободно"|"Нет мест"}, ...]
+    [{"date": "23 декабря вторник", "status": "Свободно"|"Нет мест"}, ...]
     """
     soup = BeautifulSoup(html, "lxml")
     slots: List[Dict] = []
 
-    # 1) Сначала пытаемся найти карточки календаря по типичным классам
+    # Карточки календаря на f-okno чаще всего похожи на .talon / .ticket / .day / .calendar-item
     candidate_nodes = soup.select(
-        ".calendar .day, .calendar .item, .slots-list .slot, .day-item,"
-        ".talon, .talon_item, .ticket, .ticket-item, .calendar-item, .day"
+        ".talon, .talon_item, .ticket, .ticket-item, .calendar-item, "
+        ".calendar .day, .calendar .item, .day-item, .day"
     )
+
+    def _status_from_text(t: str) -> str:
+        return "Свободно" if any(x in t for x in ("Есть места", "Доступно", "Свобод")) else "Нет мест"
+
+    def _date_from_text(t: str) -> str:
+        # Пытаемся вытащить "23 декабря вторник"
+        m = _DATE_RE.search(t)
+        if m:
+            return m.group(0).strip()
+
+        # Если regex не сработал — попробуем взять первую “разумную” часть
+        # (часто это "23 декабря вторник" или "23 декабря")
+        t = re.sub(r"\s+", " ", t).strip()
+        for junk in ("Есть места", "Свободных мест нет", "Свободных дат нет", "Нет мест"):
+            t = t.replace(junk, "").strip()
+        return t
 
     if candidate_nodes:
         for node in candidate_nodes:
-            text = node.get_text(" ", strip=True)
-            if not text:
+            t = node.get_text(" ", strip=True)
+            if not t:
                 continue
 
-            status = "Свободно" if ("Есть места" in text or "Доступно" in text or "Свобод" in text) else "Нет мест"
+            status = _status_from_text(t)
+            date = _date_from_text(t)
 
-            # дата — берём первую строку/кусок
-            date = text.splitlines()[0].strip()
-
-            # чистим статусы из даты
-            date = (
-                date.replace("Есть места", "")
-                    .replace("Свободных мест нет", "")
-                    .replace("Свободных дат нет", "")
-                    .replace("Нет мест", "")
-                    .strip()
-            )
-
-            if date:
+            # Фильтр: чтобы не тащить пустые/мусорные строки
+            if date and len(date) >= 3:
                 slots.append({"date": date, "status": status})
 
-        return slots
+        # Иногда на странице есть служебные блоки — если совсем ничего не распознали, fallback ниже
+        if slots:
+            return slots
 
-    # 2) Fallback: если карточек нет — смотрим по ключевым словам на странице
+    # --- fallback: если карточки не нашлись или не распарсились ---
     full_text = soup.get_text(" ", strip=True)
+    if any(x in full_text for x in ("Есть места", "Доступно", "Свобод")):
+        return [{"date": "Есть места (даты не распознаны)", "status": "Свободно"}]
 
-    if "Есть места" in full_text or "Доступно" in full_text or "Свобод" in full_text:
-        return [{"date": "Есть места (точная дата не распознана)", "status": "Свободно"}]
-
-    return [{"date": "Свободных дат нет", "status": "Нет мест"}]
-
-# ----- fallback: если карточки не нашли -----
-full_text = soup.get_text(" ", strip=True)
-if "Есть места" in full_text or "Доступно" in full_text or "Свобод" in full_text:
-    return [{"date": "Есть места (точная дата не распознана)", "status": "Свободно"}]
-return [{"date": "Свободных дат нет", "status": "Нет мест"}]
-
-
-    # Fallback: если конкретных карточек не нашли, посмотрим просто по ключевым словам
-
-    return slots
-
+    return []
 
 # ---------- основной прогон ----------
 def one_check_run() -> None:
