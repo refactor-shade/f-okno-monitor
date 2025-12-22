@@ -71,6 +71,18 @@ _DATE_RE = re.compile(rf"\b(\d{{1,2}})\s+({_MONTHS})(?:\s+({_WEEKDAYS}))?\b", re
 FREE_RE = re.compile(r"есть\s*мест", re.IGNORECASE)
 NO_RE = re.compile(r"(свободных\s*(мест|дат)\s*нет|нет\s*мест)", re.IGNORECASE)
 
+def _extract_human_date_from_text(text: str) -> str:
+    t = norm_text(text)
+    m = _DATE_RE.search(t)
+    if m:
+        return m.group(0).strip()
+
+    # запасной вариант без дня недели
+    m2 = re.search(rf"\b(\d{{1,2}})\s+({_MONTHS})\b", t, re.IGNORECASE)
+    if m2:
+        return m2.group(0).strip()
+
+    return ""
 
 # ---------- utils ----------
 def norm_text(s: str) -> str:
@@ -204,31 +216,66 @@ def extract_label_from_h1(driver: webdriver.Chrome) -> str:
 
 def extract_free_dates_from_dom(driver: webdriver.Chrome) -> List[str]:
     """
-    Главный устойчивый детектор:
-    свободно = .graphic_item.free
-    дата берётся из href родительского <a> как date=YYYY-MM-DD
-    """
-    dates: List[str] = []
-    seen = set()
+    Устойчивый детектор свободных дат.
 
-    cards = driver.find_elements(By.CSS_SELECTOR, ".graphic_item.free")
+    Основной путь:
+      - свободно = элемент .graphic_item.free
+      - дата берётся из href родительского <a> как date=YYYY-MM-DD
+
+    Fallback:
+      - если классы сломались, но текст "есть места" остался
+      - если href без date — берём дату из текста
+    """
+    iso_dates: List[str] = []
+    human_dates: List[str] = []
+
+    seen_iso = set()
+    seen_human = set()
+
+    cards = driver.find_elements(By.CSS_SELECTOR, ".graphic_item")
+
     for card in cards:
         try:
-            a = card.find_element(By.XPATH, "./ancestor::a[1]")
-            href = a.get_attribute("href") or ""
-            if not href:
-                continue
-            q = parse_qs(urlparse(href).query)
-            d = (q.get("date", [""])[0] or "").strip()
-            if d and d not in seen:
-                seen.add(d)
-                dates.append(d)
+            cls = (card.get_attribute("class") or "").lower()
+            txt = norm_text(card.get_attribute("innerText") or card.text or "")
         except Exception:
             continue
 
-    dates.sort()
-    return dates
+        is_free_by_class = "free" in cls.split()
+        is_free_by_text = bool(FREE_RE.search(txt)) if txt else False
 
+        if not (is_free_by_class or is_free_by_text):
+            continue
+
+        # 1) ISO дата из href
+        iso_d = ""
+        try:
+            a = card.find_element(By.XPATH, "./ancestor::a[1]")
+            href = a.get_attribute("href") or ""
+            if href:
+                q = parse_qs(urlparse(href).query)
+                iso_d = (q.get("date", [""])[0] or "").strip()
+        except Exception:
+            iso_d = ""
+
+        if iso_d:
+            if iso_d not in seen_iso:
+                seen_iso.add(iso_d)
+                iso_dates.append(iso_d)
+            continue
+
+        # 2) fallback: дата из текста
+        hd = _extract_human_date_from_text(txt)
+        if hd and hd not in seen_human:
+            seen_human.add(hd)
+            human_dates.append(hd)
+
+    if iso_dates:
+        iso_dates.sort()
+        return iso_dates
+
+    return human_dates
+    
 
 def format_free_dates(dates: List[str]) -> str:
     if not dates:
