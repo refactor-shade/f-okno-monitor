@@ -329,11 +329,9 @@ def _find_first(driver: webdriver.Chrome, css_list: List[str]):
             return els[0]
     return None
 
-
 def perform_login(driver: webdriver.Chrome) -> None:
     if not LOGIN_URL:
         raise RuntimeError("LOGIN_URL не задан.")
-
     if not F_OKNO_EMAIL or not F_OKNO_PASSWORD:
         raise RuntimeError("Нужны Secrets: F_OKNO_EMAIL и F_OKNO_PASSWORD (иначе не залогиниться).")
 
@@ -342,24 +340,15 @@ def perform_login(driver: webdriver.Chrome) -> None:
 
     if _has_antibot(driver):
         dump_debug_artifacts(driver, reason="login_antibot")
-        raise RuntimeError("На странице логина антибот/капча — headless в CI может не пройти.")
+        raise RuntimeError("Антибот/капча на странице логина.")
 
-    email_el = _find_first(driver, [
-        "input[type='email']",
-        "input[name='email']",
-        "input[name='login']",
-        "input[name*='mail']",
-        "input[autocomplete='username']",
-    ])
-    pass_el = _find_first(driver, [
-        "input[type='password']",
-        "input[name='password']",
-        "input[autocomplete='current-password']",
-    ])
+    # Поля именно такие на их форме: name="login" и name="pass"
+    email_el = _find_first(driver, ["#login_form input[name='login']", "input[name='login']"])
+    pass_el = _find_first(driver, ["#login_form input[name='pass']", "input[name='pass']", "input[type='password']"])
 
     if not email_el or not pass_el:
         dump_debug_artifacts(driver, reason="login_fields_not_found")
-        raise RuntimeError("Не нашёл поля email/пароль на странице логина (верстка поменялась?).")
+        raise RuntimeError("Не нашёл поля login/pass на странице логина (верстка поменялась?).")
 
     try:
         email_el.clear()
@@ -373,23 +362,56 @@ def perform_login(driver: webdriver.Chrome) -> None:
         pass
     pass_el.send_keys(F_OKNO_PASSWORD)
 
-    submit = _find_first(driver, [
-        "button[type='submit']",
-        "input[type='submit']",
-        "button[name='login']",
+    # Ждём, пока reCAPTCHA v3 положит токен в hidden input (иногда успевает не сразу)
+    try:
+        WebDriverWait(driver, 25).until(
+            lambda d: ((d.find_element(By.ID, "g-recaptcha-response").get_attribute("value") or "").strip() not in ("", "0"))
+        )
+    except Exception:
+        logging.warning("reCAPTCHA token not ready (or not found). Trying to submit anyway.")
+
+    # Сабмитим "как на сайте": кликом по <a onclick="doForm('login_form')"> или вызовом doForm
+    submit_link = _find_first(driver, [
+        "#login_form a.pre_button",
+        "#login_form a[onclick*='doForm']",
+        "a.pre_button.blue.large",
+        "a[onclick*=\"doForm('login_form'\"]",
+        "a[onclick*='doForm']",
     ])
-    if submit:
-        submit.click()
+
+    if submit_link:
+        driver.execute_script("arguments[0].click();", submit_link)
     else:
-        pass_el.send_keys(Keys.ENTER)
+        # запасной вариант — вызвать их JS напрямую
+        driver.execute_script(
+            "if (typeof doForm === 'function') { doForm('login_form'); } "
+            "else { document.getElementById('login_form').submit(); }"
+        )
+
+    # Ждём, что либо уйдём с /login, либо появится признак авторизации
+    def _logged_in(d):
+        url = (d.current_url or "")
+        if "/login" not in url:
+            return True
+        ps = norm_text(d.page_source).lower()
+        # иногда остаются на /login но меняется меню — ловим по словам "выход"
+        return ("выход" in ps) or ("logout" in ps)
 
     try:
-        WebDriverWait(driver, 25).until(lambda d: "/login" not in (d.current_url or ""))
+        WebDriverWait(driver, 35).until(_logged_in)
     except Exception:
+        # вытащим текст ошибки (обычно красным)
+        err = ""
+        try:
+            err = (driver.find_element(By.CSS_SELECTOR, ".pre_form_compact p[style*='color:red']").text or "").strip()
+        except Exception:
+            pass
         dump_debug_artifacts(driver, reason="login_no_redirect")
-        raise RuntimeError("После отправки формы не ушли со страницы логина (капча/неверный пароль/блок).")
+        if err:
+            raise RuntimeError(f"Логин не прошёл: {err}")
+        raise RuntimeError("После отправки формы не ушли со страницы логина (капча/блок/неверный пароль).")
 
-    wait_dom_complete(driver, timeout=30)
+    logging.info("Login OK (seems). URL now: %s", driver.current_url)
 
 
 def extract_slots_from_dom(driver: webdriver.Chrome) -> List[Dict]:
