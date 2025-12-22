@@ -128,46 +128,51 @@ def login(driver: webdriver.Chrome) -> None:
 def parse_slots_from_html(html: str) -> List[Dict]:
     """
     Универсальный парсер. Ищет карточки дат и их статусы.
-    Подстраивается под разные варианты верстки.
 
     Возвращает список:
     [{"date": "16 октября четверг", "status": "Свободно"|"Нет мест"}, ...]
     """
-    # если в requirements добавили lxml — используем его. Иначе можно поставить "html.parser"
     soup = BeautifulSoup(html, "lxml")
-
     slots: List[Dict] = []
 
-    # Попробуем сначала найти явные карточки по типичным классам
+    # 1) Сначала пытаемся найти карточки календаря по типичным классам
     candidate_nodes = soup.select(
         ".calendar .day, .calendar .item, .slots-list .slot, .day-item,"
         ".talon, .talon_item, .ticket, .ticket-item, .calendar-item, .day"
     )
-    
+
     if candidate_nodes:
         for node in candidate_nodes:
             text = node.get_text(" ", strip=True)
             if not text:
                 continue
-    
-            # статус
+
             status = "Свободно" if ("Есть места" in text or "Доступно" in text or "Свобод" in text) else "Нет мест"
-    
-            # дата
-            date = text.split("  ")[0].strip() if "  " in text else text.splitlines()[0].strip()
-    
-            # чистим статусы из даты (оба варианта)
+
+            # дата — берём первую строку/кусок
+            date = text.splitlines()[0].strip()
+
+            # чистим статусы из даты
             date = (
                 date.replace("Есть места", "")
                     .replace("Свободных мест нет", "")
+                    .replace("Свободных дат нет", "")
                     .replace("Нет мест", "")
                     .strip()
             )
-    
+
             if date:
                 slots.append({"date": date, "status": status})
-    
+
         return slots
+
+    # 2) Fallback: если карточек нет — смотрим по ключевым словам на странице
+    full_text = soup.get_text(" ", strip=True)
+
+    if "Есть места" in full_text or "Доступно" in full_text or "Свобод" in full_text:
+        return [{"date": "Есть места (точная дата не распознана)", "status": "Свободно"}]
+
+    return [{"date": "Свободных дат нет", "status": "Нет мест"}]
 
 # ----- fallback: если карточки не нашли -----
 full_text = soup.get_text(" ", strip=True)
