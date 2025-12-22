@@ -18,6 +18,7 @@ from selenium.common.exceptions import TimeoutException
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.common.by import By
+from selenium.webdriver.common.keys import Keys
 from selenium.webdriver.support.ui import WebDriverWait
 
 
@@ -29,6 +30,9 @@ logging.basicConfig(
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
+
+F_OKNO_EMAIL = os.getenv("F_OKNO_EMAIL", "").strip()
+F_OKNO_PASSWORD = os.getenv("F_OKNO_PASSWORD", "").strip()
 
 LOGIN_URL = os.getenv(
     "LOGIN_URL",
@@ -92,7 +96,6 @@ def save_snapshot(snapshot: str) -> None:
 
 
 def format_slots(slots: List[Dict], only_available: bool = True) -> str:
-    """Форматируем даты списком (только свободные — по умолчанию)."""
     if not slots:
         return "Свободных дат нет."
 
@@ -103,9 +106,8 @@ def format_slots(slots: List[Dict], only_available: bool = True) -> str:
     lines = []
     for s in filtered:
         d = (s.get("date") or "").strip()
-        if not d:
-            continue
-        lines.append(f"✅ <b>{d}</b>")
+        if d:
+            lines.append(f"✅ <b>{d}</b>")
     return "\n".join(lines) if lines else "Свободных дат нет."
 
 
@@ -132,17 +134,12 @@ def dump_debug_artifacts(driver: webdriver.Chrome, reason: str = "debug") -> Non
 
 # ---------- Selenium ----------
 def make_driver() -> webdriver.Chrome:
-    """Запускаем Chrome; Selenium Manager сам подберёт chromedriver."""
     opts = Options()
     opts.add_argument("--headless=new")
     opts.add_argument("--no-sandbox")
     opts.add_argument("--disable-dev-shm-usage")
     opts.add_argument("--window-size=1280,2000")
-
-    # Иногда помогает против странных редиректов/локалей
     opts.add_argument("--lang=ru-RU")
-    # opts.add_argument("--disable-blink-features=AutomationControlled")  # спорно, можно включать/выключать
-
     return webdriver.Chrome(service=Service(), options=opts)
 
 
@@ -152,38 +149,32 @@ def wait_dom_complete(driver: webdriver.Chrome, timeout: int = 30) -> None:
     )
 
 
-def login(driver: webdriver.Chrome) -> None:
-    """
-    Открываем LOGIN_URL (если задан).
-    Этот проект может работать и без реального ввода логина/пароля,
-    но некоторые страницы могут редиректить — поэтому после login()
-    мы ВСЕГДА переходим на TARGET_URL в one_check_run().
-    """
-    if not LOGIN_URL:
-        return
-
-    driver.get(LOGIN_URL)
-    try:
-        wait_dom_complete(driver, timeout=20)
-    except Exception:
-        logging.warning("Login page wait timeout")
-
-
 def wait_for_any_marker(driver: webdriver.Chrome, timeout: int = 45) -> str:
     """
-    Ждём не один селектор, а любой признак того, что мы на одной из ожидаемых страниц:
-    - страница слотов (есть места / нет мест)
-    - форма логина
-    - антибот/ограничение доступа
-    - (fallback) основной контейнер контента
+    Маркеры состояния страницы:
+    - SLOTS_TEXT: есть слоты/нет мест/в целом “расписание”
+    - LOGIN_FORM: форма логина
+    - ANTIBOT: капча/ограничение
     """
     end = time.time() + timeout
-
     checks: List[Tuple[str, Tuple[str, str]]] = [
-        ("SLOTS_TEXT", (By.XPATH, "//*[contains(., 'Есть места') or contains(., 'Свобод') or contains(., 'Нет мест') or contains(., 'Свободных дат нет') or contains(., 'Свободных мест нет')]")),
-        ("LOGIN_FORM", (By.CSS_SELECTOR, "form[action*='login'], input[type='password'], input[name='email'], input[name='login']")),
-        ("ANTIBOT", (By.XPATH, "//*[contains(., 'Доступ ограничен') or contains(., 'robot') or contains(., 'капча') or contains(., 'Cloudflare') or contains(., 'Access denied')]")),
-        ("CONTENT", (By.CSS_SELECTOR, "main, .container, .content, body")),
+        ("SLOTS_TEXT", (By.XPATH,
+            "//*[contains(., 'Есть места') "
+            "or contains(., 'Свободных мест нет') "
+            "or contains(., 'Свободных дат нет') "
+            "or contains(., 'Нет мест') "
+            "or contains(., 'Запись') or contains(., 'передач')]"
+        )),
+        ("LOGIN_FORM", (By.CSS_SELECTOR,
+            "form[action*='login'], input[type='password'], input[name='email'], input[name='login']"
+        )),
+        ("ANTIBOT", (By.XPATH,
+            "//*[contains(., 'Доступ ограничен') "
+            "or contains(., 'капча') "
+            "or contains(., 'Cloudflare') "
+            "or contains(., 'Access denied') "
+            "or contains(., 'robot')]"
+        )),
     ]
 
     last_url = ""
@@ -202,7 +193,91 @@ def wait_for_any_marker(driver: webdriver.Chrome, timeout: int = 45) -> str:
 
         time.sleep(0.5)
 
-    raise TimeoutException(f"Timeout waiting for page markers. Last URL: {last_url}")
+    raise TimeoutException(f"Timeout waiting for markers. Last URL: {last_url}")
+
+
+def _find_first(driver: webdriver.Chrome, css_list: List[str]) -> Optional[object]:
+    for css in css_list:
+        els = driver.find_elements(By.CSS_SELECTOR, css)
+        if els:
+            return els[0]
+    return None
+
+
+def perform_login(driver: webdriver.Chrome) -> None:
+    """
+    Реальный логин с F_OKNO_EMAIL / F_OKNO_PASSWORD.
+    Если капча/антибот — это будет видно по debug артефактам.
+    """
+    if not LOGIN_URL:
+        raise RuntimeError("LOGIN_URL не задан.")
+
+    if not F_OKNO_EMAIL or not F_OKNO_PASSWORD:
+        raise RuntimeError("Нужны Secrets: F_OKNO_EMAIL и F_OKNO_PASSWORD (иначе не залогиниться).")
+
+    driver.get(LOGIN_URL)
+    wait_dom_complete(driver, timeout=30)
+
+    marker = wait_for_any_marker(driver, timeout=30)
+    logging.info("Login page marker: %s | URL: %s", marker, driver.current_url)
+
+    if marker == "ANTIBOT":
+        dump_debug_artifacts(driver, reason="login_antibot")
+        raise RuntimeError("На странице логина антибот/капча — Selenium в GitHub Actions не проходит.")
+
+    # Попробуем найти поля максимально “мягко”
+    email_el = _find_first(driver, [
+        "input[type='email']",
+        "input[name='email']",
+        "input[name='login']",
+        "input[name*='mail']",
+        "input[autocomplete='username']",
+    ])
+    pass_el = _find_first(driver, [
+        "input[type='password']",
+        "input[name='password']",
+        "input[autocomplete='current-password']",
+    ])
+
+    if not email_el or not pass_el:
+        dump_debug_artifacts(driver, reason="login_fields_not_found")
+        raise RuntimeError("Не нашёл поля email/пароль на странице логина (верстка поменялась?).")
+
+    try:
+        email_el.clear()
+    except Exception:
+        pass
+    email_el.send_keys(F_OKNO_EMAIL)
+
+    try:
+        pass_el.clear()
+    except Exception:
+        pass
+    pass_el.send_keys(F_OKNO_PASSWORD)
+
+    # Кнопка submit
+    submit = _find_first(driver, [
+        "button[type='submit']",
+        "input[type='submit']",
+        "button[name='login']",
+    ])
+
+    if submit:
+        submit.click()
+    else:
+        # fallback: Enter в пароле
+        pass_el.send_keys(Keys.ENTER)
+
+    # ждём, что уйдём с /login (или хотя бы исчезнет форма)
+    try:
+        WebDriverWait(driver, 25).until(lambda d: "/login" not in (d.current_url or ""))
+    except Exception:
+        # могли остаться на логине из-за ошибки/капчи
+        dump_debug_artifacts(driver, reason="login_no_redirect")
+        raise RuntimeError("После отправки формы не ушли со страницы логина (возможна капча/неверный пароль).")
+
+    wait_dom_complete(driver, timeout=30)
+    logging.info("Login OK (seems). URL now: %s", driver.current_url)
 
 
 # ---------- парсинг HTML ----------
@@ -215,7 +290,6 @@ _NO_MARKERS = ("Свободных мест нет", "Свободных дат 
 
 
 def _make_soup(html: str) -> BeautifulSoup:
-    # если lxml не установлен — не падаем
     for parser in ("lxml", "html.parser"):
         try:
             return BeautifulSoup(html, parser)
@@ -225,10 +299,6 @@ def _make_soup(html: str) -> BeautifulSoup:
 
 
 def parse_slots_from_html(html: str) -> List[Dict]:
-    """
-    Возвращает список:
-    [{"date": "23 декабря вторник", "status": "Свободно"|"Нет мест"}, ...]
-    """
     soup = _make_soup(html)
     slots: List[Dict] = []
 
@@ -239,9 +309,10 @@ def parse_slots_from_html(html: str) -> List[Dict]:
     )
 
     def status_from_text(t: str) -> Optional[str]:
-        if any(x.lower() in t.lower() for x in _FREE_MARKERS):
+        tl = t.lower()
+        if any(x.lower() in tl for x in _FREE_MARKERS):
             return "Свободно"
-        if any(x.lower() in t.lower() for x in _NO_MARKERS):
+        if any(x.lower() in tl for x in _NO_MARKERS):
             return "Нет мест"
         return None
 
@@ -249,29 +320,24 @@ def parse_slots_from_html(html: str) -> List[Dict]:
         m = _DATE_RE.search(t)
         if m:
             return m.group(0).strip()
-
         t2 = re.sub(r"\s+", " ", t).strip()
         for junk in (*_FREE_MARKERS, *_NO_MARKERS):
             t2 = t2.replace(junk, "").strip()
         return t2
 
-    # 1) Пытаемся вытащить из карточек
     if candidate_nodes:
         for node in candidate_nodes:
             t = node.get_text(" ", strip=True)
             if not t:
                 continue
-
             st = status_from_text(t)
             if st is None:
                 continue
-
             d = date_from_text(t)
             if d and len(d) >= 3:
                 slots.append({"date": d, "status": st})
 
         if slots:
-            # уникализация (иногда карточки дублируются)
             uniq = []
             seen = set()
             for s in slots:
@@ -282,7 +348,6 @@ def parse_slots_from_html(html: str) -> List[Dict]:
                 uniq.append(s)
             return uniq
 
-    # 2) Fallback по всему тексту страницы
     full_text = soup.get_text("\n", strip=True)
     lines = [ln.strip() for ln in full_text.splitlines() if ln.strip()]
 
@@ -307,28 +372,50 @@ def parse_slots_from_html(html: str) -> List[Dict]:
 
 
 # ---------- основной прогон ----------
+def open_target_with_login_if_needed(driver: webdriver.Chrome) -> None:
+    """
+    Пытаемся открыть TARGET_URL.
+    Если редирект на логин — логинимся и повторяем.
+    """
+    # 1) первый заход
+    driver.get(TARGET_URL)
+    wait_dom_complete(driver, timeout=30)
+    marker = wait_for_any_marker(driver, timeout=45)
+    logging.info("Marker: %s | URL: %s", marker, driver.current_url)
+
+    if marker == "ANTIBOT":
+        dump_debug_artifacts(driver, reason="target_antibot")
+        raise RuntimeError("На TARGET_URL антибот/ограничение доступа.")
+
+    if marker != "LOGIN_FORM":
+        return
+
+    # 2) логин и повтор
+    logging.info("Redirected to login. Trying to login...")
+    dump_debug_artifacts(driver, reason="redirected_to_login")
+
+    perform_login(driver)
+
+    driver.get(TARGET_URL)
+    wait_dom_complete(driver, timeout=30)
+    marker2 = wait_for_any_marker(driver, timeout=45)
+    logging.info("Marker after login: %s | URL: %s", marker2, driver.current_url)
+
+    if marker2 == "LOGIN_FORM":
+        dump_debug_artifacts(driver, reason="still_on_login_after_login")
+        raise RuntimeError("После логина всё равно остаёмся на логине (возможна капча/блок/не та учётка).")
+
+    if marker2 == "ANTIBOT":
+        dump_debug_artifacts(driver, reason="antibot_after_login")
+        raise RuntimeError("После логина попали на антибот/ограничение доступа.")
+
+
 def one_check_run() -> None:
     driver = make_driver()
     try:
-        login(driver)
+        open_target_with_login_if_needed(driver)
 
-        # Всегда идём на целевой URL
-        driver.get(TARGET_URL)
-        wait_dom_complete(driver, timeout=30)
-
-        marker = wait_for_any_marker(driver, timeout=45)
-        logging.info("Marker: %s | URL: %s", marker, driver.current_url)
-
-        # Если мы внезапно на логине/антиботе — сохраняем артефакты и падаем осмысленно
-        if marker == "LOGIN_FORM":
-            dump_debug_artifacts(driver, reason="still_on_login")
-            raise RuntimeError("Похоже, нас редиректнуло на логин (или требуется авторизация/капча).")
-
-        if marker == "ANTIBOT":
-            dump_debug_artifacts(driver, reason="antibot")
-            raise RuntimeError("Похоже, сработала защита/ограничение доступа (антибот/капча/403).")
-
-        # Дать JS дорисовать календарь (часто это реально нужно)
+        # дать JS дорисовать календарь
         time.sleep(1.0)
 
         html = driver.page_source
@@ -341,7 +428,6 @@ def one_check_run() -> None:
         slots = parse_slots_from_html(html)
         has_free = any(s.get("status") == "Свободно" for s in slots)
 
-        # логи
         free_dates = [(s.get("date") or "").strip() for s in slots if s.get("status") == "Свободно"]
         if free_dates:
             logging.info("===> Найдены свободные слоты: %d шт.", len(free_dates))
@@ -384,3 +470,4 @@ def one_check_run() -> None:
 
 if __name__ == "__main__":
     one_check_run()
+
