@@ -1,13 +1,36 @@
-name: Monitor SIZO-11 slots
+name: Monitor SIZO slots
 
 on:
   workflow_dispatch:
   schedule:
-    - cron: "*/10 * * * *"   # раз в 10 минут (потом вернёшь чаще)
+    - cron: "*/10 * * * *"   # раз в 10 минут
 
 jobs:
   run-monitor:
     runs-on: ubuntu-latest
+
+    # Пробуем брать из secrets. Если у тебя TELEGRAM_CHAT_ID лежит в Variables (vars),
+    # код ниже всё равно его подхватит через *_VAR (см. env).
+    env:
+      # Telegram (secrets preferred)
+      TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+      TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+      # Telegram fallback (if you stored them as Actions Variables)
+      TELEGRAM_BOT_TOKEN_VAR: ${{ vars.TELEGRAM_BOT_TOKEN }}
+      TELEGRAM_CHAT_ID_VAR: ${{ vars.TELEGRAM_CHAT_ID }}
+
+      # f-okno creds
+      F_OKNO_EMAIL: ${{ secrets.F_OKNO_EMAIL }}
+      F_OKNO_PASSWORD: ${{ secrets.F_OKNO_PASSWORD }}
+
+      # target/login
+      TARGET_URL: "https://f-okno.ru/base/irkutsk/sizo3tayshet"
+      LOGIN_URL: "https://f-okno.ru/login?request_uri=%2Fbase%2Firkutsk%2Fsizo3tayshet"
+
+      # behaviour
+      ONLY_NOTIFY_WHEN_FREE: "1"
+      SE_MANAGER_USE_PATH: "0"
+      TZ: Europe/Moscow
 
     steps:
       - uses: actions/checkout@v4
@@ -22,32 +45,23 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Debug secrets presence (safe)
+      - name: Debug env presence (safe)
         run: |
           python - <<'PY'
           import os
-          for k in ["F_OKNO_EMAIL","F_OKNO_PASSWORD","TELEGRAM_BOT_TOKEN","TELEGRAM_CHAT_ID"]:
+          keys = [
+            "F_OKNO_EMAIL","F_OKNO_PASSWORD",
+            "TELEGRAM_BOT_TOKEN","TELEGRAM_CHAT_ID",
+            "TELEGRAM_BOT_TOKEN_VAR","TELEGRAM_CHAT_ID_VAR",
+            "TARGET_URL","LOGIN_URL"
+          ]
+          for k in keys:
               v = os.getenv(k, "")
               print(f"{k}: {'SET' if v else 'MISSING'} (len={len(v)})")
           PY
-        env:
-          F_OKNO_EMAIL: ${{ secrets.F_OKNO_EMAIL }}
-          F_OKNO_PASSWORD: ${{ secrets.F_OKNO_PASSWORD }}
-          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
 
       - name: Run monitor (single check)
         run: python f_okno_monitor_selenium.py
-        env:
-          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-          F_OKNO_EMAIL: ${{ secrets.F_OKNO_EMAIL }}
-          F_OKNO_PASSWORD: ${{ secrets.F_OKNO_PASSWORD }}
-          TARGET_URL: "https://f-okno.ru/base/irkutsk/sizo3tayshet"
-          LOGIN_URL: "https://f-okno.ru/login?request_uri=%2Fbase%2Firkutsk%2Fsizo3tayshet"
-          ONLY_NOTIFY_WHEN_FREE: "1"
-          SE_MANAGER_USE_PATH: "0"
-          TZ: Europe/Moscow
 
       - name: Upload debug artifacts
         if: always()
