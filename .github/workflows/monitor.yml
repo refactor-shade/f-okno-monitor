@@ -36,16 +36,16 @@ jobs:
 
       - name: Run monitor (single check)
         env:
-          # важные переменные
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-          # адреса целевой страницы (Ногинск) и логина
+
+          # ДОБАВЬ ЭТО:
+          F_OKNO_EMAIL: ${{ secrets.F_OKNO_EMAIL }}
+          F_OKNO_PASSWORD: ${{ secrets.F_OKNO_PASSWORD }}
+
           TARGET_URL: "https://f-okno.ru/base/irkutsk/sizo3tayshet"
           LOGIN_URL: "https://f-okno.ru/login?request_uri=%2Fbase%2Firkutsk%2Fsizo3tayshet"
-          # отправлять только если есть свободные слоты (1 = да, 0 = всегда)
           ONLY_NOTIFY_WHEN_FREE: "1"
-          # чтобы Selenium Manager не брал драйвер из PATH
           SE_MANAGER_USE_PATH: "0"
-          # локальное время в логах/уведомлениях
           TZ: Europe/Moscow
         run: python f_okno_monitor_selenium.py
