@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import os
 import time
 import json
@@ -5,17 +7,18 @@ import logging
 import re
 from datetime import datetime
 from zoneinfo import ZoneInfo
-from typing import List, Dict
+from typing import List, Dict, Optional, Tuple
+from pathlib import Path
 
 import requests
 from bs4 import BeautifulSoup
 
 from selenium import webdriver
+from selenium.common.exceptions import TimeoutException
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
-from selenium.webdriver.support import expected_conditions as EC
 
 
 # ---------- настройки / окружение ----------
@@ -37,8 +40,7 @@ TARGET_URL = os.getenv(
     "https://f-okno.ru/base/moscovskaya_oblast/sizo11noginsk",
 ).strip()
 
-# Чтобы текст уведомления был правильный при смене СИЗО
-SIZO_LABEL = os.getenv("SIZO_LABEL", "СИЗО-11").strip()
+SIZO_LABEL = os.getenv("SIZO_LABEL", "СИЗО").strip()
 
 STATE_FILE = os.getenv("STATE_FILE", "state.json").strip()
 ONLY_NOTIFY_WHEN_FREE = os.getenv("ONLY_NOTIFY_WHEN_FREE", "1") == "1"
@@ -46,11 +48,11 @@ ONLY_NOTIFY_WHEN_FREE = os.getenv("ONLY_NOTIFY_WHEN_FREE", "1") == "1"
 MOSCOW_TZ = ZoneInfo("Europe/Moscow")
 
 
-# ---------- утилиты ----------
+# ---------- Telegram ----------
 def send_tg(text: str) -> None:
     """Отправка сообщения в Telegram (HTML)."""
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        logging.warning("TELEGRAM_* не заданы — сообщение не отправлено.")
+        logging.warning("TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID не заданы — сообщение не отправлено.")
         return
 
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
@@ -69,6 +71,7 @@ def send_tg(text: str) -> None:
         logging.exception("Telegram send exception")
 
 
+# ---------- state ----------
 def load_last_snapshot() -> str:
     try:
         with open(STATE_FILE, "r", encoding="utf-8") as f:
@@ -106,6 +109,27 @@ def format_slots(slots: List[Dict], only_available: bool = True) -> str:
     return "\n".join(lines) if lines else "Свободных дат нет."
 
 
+# ---------- debug artifacts ----------
+def dump_debug_artifacts(driver: webdriver.Chrome, reason: str = "debug") -> None:
+    out = Path("debug")
+    out.mkdir(parents=True, exist_ok=True)
+
+    try:
+        (out / f"{reason}.url.txt").write_text(driver.current_url or "", encoding="utf-8")
+    except Exception:
+        pass
+
+    try:
+        (out / f"{reason}.page.html").write_text(driver.page_source or "", encoding="utf-8")
+    except Exception:
+        pass
+
+    try:
+        driver.save_screenshot(str(out / f"{reason}.page.png"))
+    except Exception:
+        pass
+
+
 # ---------- Selenium ----------
 def make_driver() -> webdriver.Chrome:
     """Запускаем Chrome; Selenium Manager сам подберёт chromedriver."""
@@ -114,24 +138,71 @@ def make_driver() -> webdriver.Chrome:
     opts.add_argument("--no-sandbox")
     opts.add_argument("--disable-dev-shm-usage")
     opts.add_argument("--window-size=1280,2000")
+
+    # Иногда помогает против странных редиректов/локалей
+    opts.add_argument("--lang=ru-RU")
+    # opts.add_argument("--disable-blink-features=AutomationControlled")  # спорно, можно включать/выключать
+
     return webdriver.Chrome(service=Service(), options=opts)
+
+
+def wait_dom_complete(driver: webdriver.Chrome, timeout: int = 30) -> None:
+    WebDriverWait(driver, timeout).until(
+        lambda d: d.execute_script("return document.readyState") == "complete"
+    )
 
 
 def login(driver: webdriver.Chrome) -> None:
     """
     Открываем LOGIN_URL (если задан).
-    ВАЖНО: этот проект может работать и без реального ввода логина/пароля,
-    но некоторые страницы могут редиректить — поэтому после login() мы ВСЕГДА
-    переходим на TARGET_URL в one_check_run().
+    Этот проект может работать и без реального ввода логина/пароля,
+    но некоторые страницы могут редиректить — поэтому после login()
+    мы ВСЕГДА переходим на TARGET_URL в one_check_run().
     """
     if not LOGIN_URL:
         return
 
     driver.get(LOGIN_URL)
     try:
-        WebDriverWait(driver, 15).until(EC.presence_of_element_located((By.CSS_SELECTOR, "body")))
+        wait_dom_complete(driver, timeout=20)
     except Exception:
         logging.warning("Login page wait timeout")
+
+
+def wait_for_any_marker(driver: webdriver.Chrome, timeout: int = 45) -> str:
+    """
+    Ждём не один селектор, а любой признак того, что мы на одной из ожидаемых страниц:
+    - страница слотов (есть места / нет мест)
+    - форма логина
+    - антибот/ограничение доступа
+    - (fallback) основной контейнер контента
+    """
+    end = time.time() + timeout
+
+    checks: List[Tuple[str, Tuple[str, str]]] = [
+        ("SLOTS_TEXT", (By.XPATH, "//*[contains(., 'Есть места') or contains(., 'Свобод') or contains(., 'Нет мест') or contains(., 'Свободных дат нет') or contains(., 'Свободных мест нет')]")),
+        ("LOGIN_FORM", (By.CSS_SELECTOR, "form[action*='login'], input[type='password'], input[name='email'], input[name='login']")),
+        ("ANTIBOT", (By.XPATH, "//*[contains(., 'Доступ ограничен') or contains(., 'robot') or contains(., 'капча') or contains(., 'Cloudflare') or contains(., 'Access denied')]")),
+        ("CONTENT", (By.CSS_SELECTOR, "main, .container, .content, body")),
+    ]
+
+    last_url = ""
+    while time.time() < end:
+        try:
+            last_url = driver.current_url
+        except Exception:
+            pass
+
+        for name, (by, sel) in checks:
+            try:
+                if driver.find_elements(by, sel):
+                    return name
+            except Exception:
+                continue
+
+        time.sleep(0.5)
+
+    raise TimeoutException(f"Timeout waiting for page markers. Last URL: {last_url}")
 
 
 # ---------- парсинг HTML ----------
@@ -143,26 +214,35 @@ _FREE_MARKERS = ("Есть места", "Доступно", "Свобод")
 _NO_MARKERS = ("Свободных мест нет", "Свободных дат нет", "Нет мест")
 
 
+def _make_soup(html: str) -> BeautifulSoup:
+    # если lxml не установлен — не падаем
+    for parser in ("lxml", "html.parser"):
+        try:
+            return BeautifulSoup(html, parser)
+        except Exception:
+            continue
+    return BeautifulSoup(html, "html.parser")
+
+
 def parse_slots_from_html(html: str) -> List[Dict]:
     """
     Возвращает список:
     [{"date": "23 декабря вторник", "status": "Свободно"|"Нет мест"}, ...]
     """
-    soup = BeautifulSoup(html, "lxml")
+    soup = _make_soup(html)
     slots: List[Dict] = []
 
-    # Самые частые “карточки” календаря на f-okno
     candidate_nodes = soup.select(
         ".talon, .talon_item, .ticket, .ticket-item, .calendar-item, "
-        ".calendar .day, .calendar .item, .day-item, .day"
+        ".calendar .day, .calendar .item, .day-item, .day, "
+        "[class*='talon'], [class*='ticket'], [class*='calendar']"
     )
 
-    def status_from_text(t: str) -> str | None:
-        if any(x in t for x in _FREE_MARKERS):
+    def status_from_text(t: str) -> Optional[str]:
+        if any(x.lower() in t.lower() for x in _FREE_MARKERS):
             return "Свободно"
-        if any(x in t for x in _NO_MARKERS):
+        if any(x.lower() in t.lower() for x in _NO_MARKERS):
             return "Нет мест"
-        # карточка может быть “пустая/серая” — не считаем её вообще
         return None
 
     def date_from_text(t: str) -> str:
@@ -170,7 +250,6 @@ def parse_slots_from_html(html: str) -> List[Dict]:
         if m:
             return m.group(0).strip()
 
-        # fallback: уберём мусор и вернём хоть что-то осмысленное
         t2 = re.sub(r"\s+", " ", t).strip()
         for junk in (*_FREE_MARKERS, *_NO_MARKERS):
             t2 = t2.replace(junk, "").strip()
@@ -192,15 +271,23 @@ def parse_slots_from_html(html: str) -> List[Dict]:
                 slots.append({"date": d, "status": st})
 
         if slots:
-            return slots
+            # уникализация (иногда карточки дублируются)
+            uniq = []
+            seen = set()
+            for s in slots:
+                key = (s.get("date"), s.get("status"))
+                if key in seen:
+                    continue
+                seen.add(key)
+                uniq.append(s)
+            return uniq
 
     # 2) Fallback по всему тексту страницы
     full_text = soup.get_text("\n", strip=True)
     lines = [ln.strip() for ln in full_text.splitlines() if ln.strip()]
 
-    free_lines = [ln for ln in lines if any(x in ln for x in _FREE_MARKERS)]
+    free_lines = [ln for ln in lines if any(x.lower() in ln.lower() for x in _FREE_MARKERS)]
     if free_lines:
-        # Попробуем вытащить даты из строк где “Есть места”
         found_dates = []
         for ln in free_lines:
             m = _DATE_RE.search(ln)
@@ -208,14 +295,12 @@ def parse_slots_from_html(html: str) -> List[Dict]:
                 found_dates.append(m.group(0).strip())
 
         if found_dates:
-            # уникализируем, сохраняя порядок
             uniq = []
             for d in found_dates:
                 if d not in uniq:
                     uniq.append(d)
             return [{"date": d, "status": "Свободно"} for d in uniq]
 
-        # если даты не извлеклись — хотя бы скажем “есть места”
         return [{"date": "Есть места (даты не распознаны)", "status": "Свободно"}]
 
     return []
@@ -227,37 +312,42 @@ def one_check_run() -> None:
     try:
         login(driver)
 
-        # КЛЮЧЕВОЕ: всегда переходим на TARGET_URL перед парсингом
+        # Всегда идём на целевой URL
         driver.get(TARGET_URL)
+        wait_dom_complete(driver, timeout=30)
 
-        # Ждём, пока страница действительно прогрузится
-        # (на некоторых СИЗО календарь подтягивается JS-ом)
-        WebDriverWait(driver, 25).until(
-            lambda d: ("Запись на передачу" in d.page_source)
-                      or ("Есть места" in d.page_source)
-                      or ("Свободных мест нет" in d.page_source)
-                      or ("Свободных дат нет" in d.page_source)
-        )
+        marker = wait_for_any_marker(driver, timeout=45)
+        logging.info("Marker: %s | URL: %s", marker, driver.current_url)
 
-        # Небольшая страховка: дать дорисоваться плиткам
-        time.sleep(1)
+        # Если мы внезапно на логине/антиботе — сохраняем артефакты и падаем осмысленно
+        if marker == "LOGIN_FORM":
+            dump_debug_artifacts(driver, reason="still_on_login")
+            raise RuntimeError("Похоже, нас редиректнуло на логин (или требуется авторизация/капча).")
+
+        if marker == "ANTIBOT":
+            dump_debug_artifacts(driver, reason="antibot")
+            raise RuntimeError("Похоже, сработала защита/ограничение доступа (антибот/капча/403).")
+
+        # Дать JS дорисовать календарь (часто это реально нужно)
+        time.sleep(1.0)
 
         html = driver.page_source
-        with open("page.html", "w", encoding="utf-8") as f:
-            f.write(html)
+        Path("page.html").write_text(html, encoding="utf-8")
+        try:
+            driver.save_screenshot("page.png")
+        except Exception:
+            pass
 
         slots = parse_slots_from_html(html)
         has_free = any(s.get("status") == "Свободно" for s in slots)
 
-        # для логов покажем, что нашли
+        # логи
         free_dates = [(s.get("date") or "").strip() for s in slots if s.get("status") == "Свободно"]
         if free_dates:
-            logging.info("URL: %s", driver.current_url)
             logging.info("===> Найдены свободные слоты: %d шт.", len(free_dates))
             for d in free_dates:
                 logging.info("FREE_DATE: %s", d)
         else:
-            logging.info("URL: %s", driver.current_url)
             logging.info("===> Свободных слотов нет.")
 
         snapshot = json.dumps(slots, ensure_ascii=False, sort_keys=True)
@@ -274,20 +364,22 @@ def one_check_run() -> None:
                 send_tg(text)
 
             save_snapshot(snapshot)
+            logging.info("Snapshot изменился — сохранено.")
         else:
             logging.info("Без изменений (snapshot не менялся).")
 
     except Exception:
         logging.exception("FATAL")
         try:
-            driver.save_screenshot("page.png")
-            with open("page.html", "w", encoding="utf-8") as f:
-                f.write(driver.page_source)
+            dump_debug_artifacts(driver, reason="fatal")
         except Exception:
             pass
         raise
     finally:
-        driver.quit()
+        try:
+            driver.quit()
+        except Exception:
+            pass
 
 
 if __name__ == "__main__":
