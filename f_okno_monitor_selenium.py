@@ -139,28 +139,42 @@ def parse_slots_from_html(html: str) -> List[Dict]:
     slots: List[Dict] = []
 
     # Попробуем сначала найти явные карточки по типичным классам
-    # (эти селекторы можно при необходимости подточить под актуальную верстку)
-    candidate_nodes = soup.select(".calendar .day, .calendar .item, .slots-list .slot, .day-item")
-
+    candidate_nodes = soup.select(
+        ".calendar .day, .calendar .item, .slots-list .slot, .day-item,"
+        ".talon, .talon_item, .ticket, .ticket-item, .calendar-item, .day"
+    )
+    
     if candidate_nodes:
         for node in candidate_nodes:
             text = node.get_text(" ", strip=True)
             if not text:
                 continue
-
+    
             # статус
             status = "Свободно" if ("Есть места" in text or "Доступно" in text or "Свобод" in text) else "Нет мест"
-
-            # дата — возьмём первую строчку/кусок, похожий на дату
-            # часто дата крупнее и стоит в начале карточки
-            # для надёжности вычленим число + месяц, остальное оставим как есть
+    
+            # дата
             date = text.split("  ")[0].strip() if "  " in text else text.splitlines()[0].strip()
-            # немного подчистим мусор
-            date = date.replace("Есть места", "").replace("Нет мест", "").strip()
+    
+            # чистим статусы из даты (оба варианта)
+            date = (
+                date.replace("Есть места", "")
+                    .replace("Свободных мест нет", "")
+                    .replace("Нет мест", "")
+                    .strip()
+            )
+    
             if date:
                 slots.append({"date": date, "status": status})
-
+    
         return slots
+
+# ----- fallback: если карточки не нашли -----
+full_text = soup.get_text(" ", strip=True)
+if "Есть места" in full_text or "Доступно" in full_text or "Свобод" in full_text:
+    return [{"date": "Есть места (точная дата не распознана)", "status": "Свободно"}]
+return [{"date": "Свободных дат нет", "status": "Нет мест"}]
+
 
     # Fallback: если конкретных карточек не нашли, посмотрим просто по ключевым словам
     text = soup.get_text("\n", strip=True)
