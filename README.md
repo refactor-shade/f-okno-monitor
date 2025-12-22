@@ -89,8 +89,9 @@ Settings → Secrets and variables → Actions → New repository secret
 - F_OKNO_EMAIL — email (логин) от аккаунта на f-okno.ru
 - F_OKNO_PASSWORD — пароль от аккаунта на f-okno.ru
 
-⚠️ Эти данные **никогда не должны попадать в код**!
-⚠️ Если вы меняете пароль на f-okno.ru — обновите `F_OKNO_PASSWORD` в Secrets.
+⚠️ Важно:
+- Эти данные **никогда не должны попадать в код**!
+- Если вы меняете пароль на f-okno.ru — обновите `F_OKNO_PASSWORD` в Secrets.
 
 ---
 
