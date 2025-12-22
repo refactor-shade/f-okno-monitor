@@ -3,19 +3,17 @@ name: Monitor SIZO slots
 on:
   workflow_dispatch:
   schedule:
-    - cron: "*/10 * * * *"   # раз в 10 минут
+    - cron: "*/10 * * * *"   # раз в 10 минут (GitHub может задерживать)
 
 jobs:
   run-monitor:
     runs-on: ubuntu-latest
 
-    # Пробуем брать из secrets. Если у тебя TELEGRAM_CHAT_ID лежит в Variables (vars),
-    # код ниже всё равно его подхватит через *_VAR (см. env).
     env:
       # Telegram (secrets preferred)
       TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
       TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-      # Telegram fallback (if you stored them as Actions Variables)
+      # Telegram fallback (if stored as Actions Variables)
       TELEGRAM_BOT_TOKEN_VAR: ${{ vars.TELEGRAM_BOT_TOKEN }}
       TELEGRAM_CHAT_ID_VAR: ${{ vars.TELEGRAM_CHAT_ID }}
 
@@ -23,17 +21,37 @@ jobs:
       F_OKNO_EMAIL: ${{ secrets.F_OKNO_EMAIL }}
       F_OKNO_PASSWORD: ${{ secrets.F_OKNO_PASSWORD }}
 
-      # target/login
+      # Only one link required
       TARGET_URL: "https://f-okno.ru/base/moscovskaya_oblast/sizo11noginsk"
-      LOGIN_URL: "https://f-okno.ru/login?request_uri=%2Fbase%2Fmoscovskaya_oblast%2Fsizo11noginsk"
 
-      # behaviour
+      # Optional: you can omit these; label is auto from <h1>
+      SIZO_LABEL: "СИЗО"
       ONLY_NOTIFY_WHEN_FREE: "1"
-      SE_MANAGER_USE_PATH: "0"
+      TRY_REQUESTS_FIRST: "0"
+
+      # State
+      STATE_FILE: "state.json"
+
+      # Optional burst mode (to catch minute-long slots):
+      # 0 = disabled (single check). Try 20 for a 20-minute run.
+      BURST_MINUTES: "0"
+      BURST_SLEEP_MIN: "75"
+      BURST_SLEEP_MAX: "105"
+      MAX_LOGINS_PER_RUN: "2"
+
       TZ: Europe/Moscow
 
     steps:
       - uses: actions/checkout@v4
+
+      - name: Restore state cache
+        uses: actions/cache@v4
+        with:
+          path: state.json
+          key: state-${{ env.TARGET_URL }}-${{ github.run_id }}
+          restore-keys: |
+            state-${{ env.TARGET_URL }}-
+            state-
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -53,15 +71,19 @@ jobs:
             "F_OKNO_EMAIL","F_OKNO_PASSWORD",
             "TELEGRAM_BOT_TOKEN","TELEGRAM_CHAT_ID",
             "TELEGRAM_BOT_TOKEN_VAR","TELEGRAM_CHAT_ID_VAR",
-            "TARGET_URL","LOGIN_URL"
+            "TARGET_URL","STATE_FILE",
+            "BURST_MINUTES","BURST_SLEEP_MIN","BURST_SLEEP_MAX",
           ]
           for k in keys:
               v = os.getenv(k, "")
               print(f"{k}: {'SET' if v else 'MISSING'} (len={len(v)})")
           PY
 
-      - name: Run monitor (single check)
+      - name: Run monitor (single run)
         run: python f_okno_monitor_selenium.py
+
+      # Save cache by using a unique key per run (already done above via run_id)
+      # actions/cache will store the updated state.json at the end of the job when using that key.
 
       - name: Upload debug artifacts
         if: always()
@@ -72,3 +94,4 @@ jobs:
             debug/*
             page.html
             page.png
+            state.json
