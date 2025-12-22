@@ -182,14 +182,6 @@ return [{"date": "Свободных дат нет", "status": "Нет мест"
 
 
     # Fallback: если конкретных карточек не нашли, посмотрим просто по ключевым словам
-    text = soup.get_text("\n", strip=True)
-    lines = [ln for ln in text.splitlines() if ln]
-
-    for ln in lines:
-        if "Есть места" in ln or "Свобод" in ln:
-            slots.append({"date": ln.replace("Есть места", "").strip(), "status": "Свободно"})
-        elif "Нет мест" in ln:
-            slots.append({"date": ln.replace("Нет мест", "").strip(), "status": "Нет мест"})
 
     return slots
 
