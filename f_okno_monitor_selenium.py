@@ -282,45 +282,52 @@ def _has_antibot(driver: webdriver.Chrome) -> bool:
 
 def _candidate_tile_elements(driver: webdriver.Chrome):
     css = (
+        "#graphic_wrapper a, #graphic_container a, "
+        ".graphic_item, .graphic_item.free, .graphic_item.red, .graphic_item.disabled, "
         ".talon, .talon_item, .ticket, .ticket-item, .calendar-item, "
         ".calendar .day, .calendar .item, .day-item, .day, "
-        "[class*='talon'], [class*='ticket'], [class*='calendar'], [class*='day']"
+        "[class*='talon'], [class*='ticket'], [class*='calendar'], [class*='day'], [class*='graphic_item']"
     )
     try:
         return driver.find_elements(By.CSS_SELECTOR, css)
     except Exception:
         return []
 
-
-def wait_for_calendar_or_login(driver: webdriver.Chrome, timeout: int = 45) -> str:
+def wait_for_calendar_or_login(driver: webdriver.Chrome, timeout: int = 60) -> str:
     """
     Возвращает: SLOTS | LOGIN | ANTIBOT
-    Ключевой фикс: если URL /login — НЕ считаем это "слоты" по словам "Запись", а ищем именно календарные плитки.
+
+    Фикс под f-okno:
+    - календарь на /base/... рисуется как #graphic_wrapper с элементами .graphic_item
+    - свободные дни обычно имеют класс .graphic_item.free
     """
     end = time.time() + timeout
+
     while time.time() < end:
         url = (driver.current_url or "").lower()
 
+        # 1) антибот/капча
         if _has_antibot(driver):
             return "ANTIBOT"
 
-        tiles = _candidate_tile_elements(driver)
-        # календарь обычно даёт много плиток
-        if len(tiles) >= 6:
-            # и/или хотя бы один "Есть места"/"Нет мест" в тексте
-            ps = norm_text(driver.page_source)
-            if FREE_RE.search(ps) or NO_RE.search(ps):
-                return "SLOTS"
-            # бывает, что текст внутри .text, но не в page_source сразу — всё равно считаем как SLOTS
-            return "SLOTS"
-
+        # 2) признак логина
         if "/login" in url and _has_login_form(driver):
             return "LOGIN"
+
+        # 3) быстрый признак календаря по HTML (f-okno)
+        ps = driver.page_source or ""
+        if ("id=\"graphic_wrapper\"" in ps) or ("graphic_item" in ps):
+            # даже если нет текста, но есть график — считаем, что календарь есть
+            return "SLOTS"
+
+        # 4) универсальный признак календаря по DOM (на будущее)
+        tiles = _candidate_tile_elements(driver)
+        if len(tiles) >= 6:
+            return "SLOTS"
 
         time.sleep(0.5)
 
     raise TimeoutException(f"Timeout waiting for calendar/login. URL={driver.current_url}")
-
 
 def _find_first(driver: webdriver.Chrome, css_list: List[str]):
     for css in css_list:
@@ -416,38 +423,84 @@ def perform_login(driver: webdriver.Chrome) -> None:
 
 def extract_slots_from_dom(driver: webdriver.Chrome) -> List[Dict]:
     """
-    Главный фикс: парсим НЕ из page_source, а из DOM-элементов (selenium .text уже нормализует NBSP/переносы).
+    Главный парсер слотов прямо из DOM.
+
+    Фикс под f-okno:
+    - карточки календаря: .graphic_item
+    - свободные дни: .graphic_item.free
+    - внутри текст 'Есть места'
     """
-    tiles = _candidate_tile_elements(driver)
     slots: List[Dict] = []
 
-    for el in tiles:
+    # 1) Самый надёжный путь: f-okno конкретно
+    try:
+        free_cards = driver.find_elements(By.CSS_SELECTOR, ".graphic_item.free")
+    except Exception:
+        free_cards = []
+
+    for card in free_cards:
         try:
-            t = norm_text(el.text)
+            txt = norm_text(card.text)
         except Exception:
             continue
-        if not t:
+        if not txt:
             continue
 
-        is_free = bool(FREE_RE.search(t))
-        is_no = bool(NO_RE.search(t))
+        # На всякий случай проверим маркер "Есть места"
+        if not FREE_RE.search(txt):
+            # иногда текст внутри может быть в дочернем, попробуем innerText
+            try:
+                inner = norm_text(card.get_attribute("innerText") or "")
+            except Exception:
+                inner = ""
+            if not FREE_RE.search(inner):
+                continue
+            txt = inner
 
-        if not (is_free or is_no):
-            continue
+        d = _extract_date_from_text(txt)
+        slots.append({"date": d or "Есть места (даты не распознаны)", "status": "Свободно"})
 
-        d = _extract_date_from_text(t)
-        if not d:
-            # иногда дата разбита по подполя-м, но общий текст плитки всё равно содержит число и месяц
-            d = _extract_date_from_text(norm_text(el.get_attribute("innerText") or ""))
-
-        slots.append({
-            "date": d or ("Есть места (даты не распознаны)" if is_free else "Нет мест (даты не распознаны)"),
-            "status": "Свободно" if is_free else "Нет мест",
-        })
-
-    # уникализация
     if slots:
-        uniq = []
+        # уникализация по дате
+        uniq: List[Dict] = []
+        seen = set()
+        for it in slots:
+            if it["date"] in seen:
+                continue
+            seen.add(it["date"])
+            uniq.append(it)
+        return uniq
+
+    # 2) Если свободных не нашли — соберём "Нет мест" (полезно для snapshot)
+    try:
+        no_cards = driver.find_elements(By.CSS_SELECTOR, ".graphic_item.red, .graphic_item.disabled")
+    except Exception:
+        no_cards = []
+
+    for card in no_cards:
+        try:
+            txt = norm_text(card.text)
+        except Exception:
+            continue
+        if not txt:
+            continue
+
+        if not NO_RE.search(txt):
+            try:
+                inner = norm_text(card.get_attribute("innerText") or "")
+            except Exception:
+                inner = ""
+            if not NO_RE.search(inner):
+                continue
+            txt = inner
+
+        d = _extract_date_from_text(txt)
+        if d:
+            slots.append({"date": d, "status": "Нет мест"})
+
+    if slots:
+        # уникализация по (date,status)
+        uniq: List[Dict] = []
         seen = set()
         for it in slots:
             key = (it["date"], it["status"])
@@ -457,7 +510,7 @@ def extract_slots_from_dom(driver: webdriver.Chrome) -> List[Dict]:
             uniq.append(it)
         return uniq
 
-    # fallback на HTML
+    # 3) Fallback: парсинг из HTML (если DOM-структура не совпала)
     return parse_slots_from_html(driver.page_source or "")
 
 
