@@ -7,8 +7,9 @@ import logging
 import re
 from datetime import datetime
 from zoneinfo import ZoneInfo
-from typing import List, Dict, Optional, Tuple
+from typing import List, Dict, Optional
 from pathlib import Path
+from urllib.parse import urlparse, parse_qs, quote
 
 import requests
 from bs4 import BeautifulSoup
@@ -18,7 +19,6 @@ from selenium.common.exceptions import TimeoutException
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.common.by import By
-from selenium.webdriver.common.keys import Keys
 from selenium.webdriver.support.ui import WebDriverWait
 
 
@@ -28,27 +28,38 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(message)s",
 )
 
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
+# Telegram (Secrets preferred, Variables fallback)
+TELEGRAM_BOT_TOKEN = (os.getenv("TELEGRAM_BOT_TOKEN") or os.getenv("TELEGRAM_BOT_TOKEN_VAR") or "").strip()
+TELEGRAM_CHAT_ID = (os.getenv("TELEGRAM_CHAT_ID") or os.getenv("TELEGRAM_CHAT_ID_VAR") or "").strip()
 
+# f-okno creds
 F_OKNO_EMAIL = os.getenv("F_OKNO_EMAIL", "").strip()
 F_OKNO_PASSWORD = os.getenv("F_OKNO_PASSWORD", "").strip()
 
-LOGIN_URL = os.getenv(
-    "LOGIN_URL",
-    "https://f-okno.ru/login?request_uri=%2Fbase%2Fmoscovskaya_oblast%2Fsizo11noginsk",
-).strip()
-
+# Target
 TARGET_URL = os.getenv(
     "TARGET_URL",
     "https://f-okno.ru/base/moscovskaya_oblast/sizo11noginsk",
 ).strip()
 
-SIZO_LABEL = os.getenv("SIZO_LABEL", "СИЗО").strip()
+# Optional override, but normally auto-computed from TARGET_URL
+LOGIN_URL = os.getenv("LOGIN_URL", "").strip()
 
+# Human label fallback if h1 not found
+SIZO_LABEL_FALLBACK = os.getenv("SIZO_LABEL", "СИЗО").strip()
+
+# State
 STATE_FILE = os.getenv("STATE_FILE", "state.json").strip()
+
+# Behavior
 ONLY_NOTIFY_WHEN_FREE = os.getenv("ONLY_NOTIFY_WHEN_FREE", "1") == "1"
-TRY_REQUESTS_FIRST = os.getenv("TRY_REQUESTS_FIRST", "1") == "1"
+TRY_REQUESTS_FIRST = os.getenv("TRY_REQUESTS_FIRST", "0") == "1"  # по умолчанию выключено, т.к. календарь после логина
+
+# Burst mode (optional, default: single check per run)
+BURST_MINUTES = int(os.getenv("BURST_MINUTES", "0") or "0")  # 0 = нет цикла
+BURST_SLEEP_MIN = float(os.getenv("BURST_SLEEP_MIN", "75") or "75")
+BURST_SLEEP_MAX = float(os.getenv("BURST_SLEEP_MAX", "105") or "105")
+MAX_LOGINS_PER_RUN = int(os.getenv("MAX_LOGINS_PER_RUN", "2") or "2")
 
 MOSCOW_TZ = ZoneInfo("Europe/Moscow")
 
@@ -66,6 +77,23 @@ def norm_text(s: str) -> str:
     s = (s or "").replace("\xa0", " ")
     s = re.sub(r"\s+", " ", s).strip()
     return s
+
+
+def build_login_url_from_target(target_url: str) -> str:
+    """
+    f-okno логин URL: /login?request_uri=%2Fbase%2F...
+    """
+    try:
+        u = urlparse(target_url)
+        path = u.path or ""
+        if not path.startswith("/"):
+            path = "/" + path
+        # request_uri expects encoded path where / -> %2F
+        request_uri = quote(path, safe="")  # encodes '/' too
+        return f"{u.scheme}://{u.netloc}/login?request_uri={request_uri}"
+    except Exception:
+        # fallback to old default if somehow failed
+        return "https://f-okno.ru/login"
 
 
 def send_tg(text: str) -> None:
@@ -89,39 +117,27 @@ def send_tg(text: str) -> None:
         logging.exception("Telegram send exception")
 
 
-def load_last_snapshot() -> str:
+def load_last_free_dates() -> List[str]:
     try:
         with open(STATE_FILE, "r", encoding="utf-8") as f:
-            return f.read()
+            data = json.load(f)
+        dates = data.get("free_dates", [])
+        cleaned = sorted({str(x).strip() for x in dates if str(x).strip()})
+        return cleaned
     except FileNotFoundError:
-        return ""
+        return []
     except Exception:
-        logging.exception("load_last_snapshot failed")
-        return ""
+        logging.exception("load_last_free_dates failed")
+        return []
 
 
-def save_snapshot(snapshot: str) -> None:
+def save_free_dates(free_dates: List[str]) -> None:
     try:
+        payload = {"free_dates": sorted({d.strip() for d in free_dates if d and d.strip()})}
         with open(STATE_FILE, "w", encoding="utf-8") as f:
-            f.write(snapshot)
+            json.dump(payload, f, ensure_ascii=False, sort_keys=True)
     except Exception:
-        logging.exception("save_snapshot failed")
-
-
-def format_slots(slots: List[Dict], only_available: bool = True) -> str:
-    if not slots:
-        return "Свободных дат нет."
-
-    filtered = [s for s in slots if s.get("status") == "Свободно"] if only_available else slots
-    if not filtered:
-        return "Свободных дат нет."
-
-    lines = []
-    for s in filtered:
-        d = (s.get("date") or "").strip()
-        if d:
-            lines.append(f"✅ <b>{d}</b>")
-    return "\n".join(lines) if lines else "Свободных дат нет."
+        logging.exception("save_free_dates failed")
 
 
 def dump_debug_artifacts(driver: webdriver.Chrome, reason: str = "debug") -> None:
@@ -143,6 +159,21 @@ def dump_debug_artifacts(driver: webdriver.Chrome, reason: str = "debug") -> Non
     except Exception:
         pass
 
+    try:
+        (out / f"{reason}.summary.txt").write_text(
+            "\n".join(
+                [
+                    f"reason={reason}",
+                    f"target={TARGET_URL}",
+                    f"current_url={driver.current_url}",
+                    f"time_msk={datetime.now(MOSCOW_TZ).strftime('%Y-%m-%d %H:%M:%S')}",
+                ]
+            ),
+            encoding="utf-8",
+        )
+    except Exception:
+        pass
+
 
 def _make_soup(html: str) -> BeautifulSoup:
     for parser in ("lxml", "html.parser"):
@@ -153,74 +184,63 @@ def _make_soup(html: str) -> BeautifulSoup:
     return BeautifulSoup(html, "html.parser")
 
 
-def _extract_date_from_text(text: str) -> str:
-    t = norm_text(text)
-    m = _DATE_RE.search(t)
-    if m:
-        return m.group(0).strip()
-    m2 = re.search(rf"\b(\d{{1,2}})\s+({_MONTHS})\b", t, re.IGNORECASE)
-    if m2:
-        return m2.group(0).strip()
-    return ""
-
-
-# ---------- parsing (HTML fallback) ----------
-def parse_slots_from_html(html: str) -> List[Dict]:
+def extract_label_from_h1(driver: webdriver.Chrome) -> str:
     """
-    Устойчиво к NBSP/переносам и вложенным элементам.
+    Берём красивый SIZO_LABEL из <h1> типа:
+    <h1>СИЗО-12 Зеленоград(<a ...>Москва</a>)</h1>
     """
-    soup = _make_soup(html)
-    slots: List[Dict] = []
+    try:
+        h1 = driver.find_element(By.CSS_SELECTOR, "h1")
+        txt = norm_text(h1.text)
+        if not txt:
+            return SIZO_LABEL_FALLBACK
+        # привести "(Москва)" к " (Москва)" — чуть красивее
+        txt = re.sub(r"\(\s*", " (", txt)
+        txt = re.sub(r"\s*\)", ")", txt)
+        return txt
+    except Exception:
+        return SIZO_LABEL_FALLBACK
 
-    def climb_for_card_text(node) -> str:
-        cur = node
-        for _ in range(7):
-            if not cur:
-                break
-            try:
-                txt = norm_text(cur.get_text(" ", strip=True))
-            except Exception:
-                txt = ""
-            if txt and (re.search(rf"\b(\d{{1,2}})\s+({_MONTHS})\b", txt, re.IGNORECASE) or _DATE_RE.search(txt)):
-                return txt
-            cur = getattr(cur, "parent", None)
+
+def extract_free_dates_from_dom(driver: webdriver.Chrome) -> List[str]:
+    """
+    Главный устойчивый детектор:
+    свободно = .graphic_item.free
+    дата берётся из href родительского <a> как date=YYYY-MM-DD
+    """
+    dates: List[str] = []
+    seen = set()
+
+    cards = driver.find_elements(By.CSS_SELECTOR, ".graphic_item.free")
+    for card in cards:
         try:
-            return norm_text(node.parent.get_text(" ", strip=True)) if node and node.parent else ""
-        except Exception:
-            return ""
-
-    # 1) Свободные
-    for s in soup.find_all(string=FREE_RE):
-        card_text = climb_for_card_text(getattr(s, "parent", None))
-        d = _extract_date_from_text(card_text)
-        slots.append({"date": d or "Есть места (даты не распознаны)", "status": "Свободно"})
-
-    if slots:
-        uniq = []
-        seen = set()
-        for it in slots:
-            if it["date"] in seen:
+            a = card.find_element(By.XPATH, "./ancestor::a[1]")
+            href = a.get_attribute("href") or ""
+            if not href:
                 continue
-            seen.add(it["date"])
-            uniq.append(it)
-        return uniq
+            q = parse_qs(urlparse(href).query)
+            d = (q.get("date", [""])[0] or "").strip()
+            if d and d not in seen:
+                seen.add(d)
+                dates.append(d)
+        except Exception:
+            continue
 
-    # 2) Нет мест
-    for s in soup.find_all(string=NO_RE):
-        card_text = climb_for_card_text(getattr(s, "parent", None))
-        d = _extract_date_from_text(card_text)
-        if d:
-            slots.append({"date": d, "status": "Нет мест"})
+    dates.sort()
+    return dates
 
-    return slots
+
+def format_free_dates(dates: List[str]) -> str:
+    if not dates:
+        return "Свободных дат нет."
+    return "\n".join([f"✅ <b>{d}</b>" for d in dates])
 
 
 # ---------- requests first (optional) ----------
-def try_requests_fetch() -> Optional[List[Dict]]:
+def try_requests_fetch_free_dates() -> Optional[List[str]]:
     """
-    Иногда страница отдаёт готовый HTML и без Selenium.
-    Если получилось распарсить — возвращаем список слотов.
-    Если редирект/логин/пусто — вернём None и пойдём в Selenium.
+    Иногда страница может отдать готовый HTML.
+    Мы не шлём "нет мест", поэтому если free не нашли — возвращаем None и идём в Selenium.
     """
     try:
         headers = {
@@ -230,19 +250,32 @@ def try_requests_fetch() -> Optional[List[Dict]]:
             )
         }
         r = requests.get(TARGET_URL, headers=headers, timeout=25, allow_redirects=True)
-        html = r.text or ""
-        # если нас перекинуло на логин — смысла парсить нет
         if "/login" in (r.url or ""):
             return None
 
-        # быстрый “сигнал”, что на странице реально есть "Есть места"
-        if not FREE_RE.search(norm_text(html)):
+        html = r.text or ""
+        # быстрый признак календаря
+        if "graphic_item" not in html:
             return None
 
-        slots = parse_slots_from_html(html)
-        if slots:
-            return slots
-        return None
+        soup = _make_soup(html)
+        free_dates = []
+        seen = set()
+
+        # ищем a внутри которых есть .graphic_item.free
+        for a in soup.select("a:has(.graphic_item.free)"):
+            href = a.get("href") or ""
+            if not href:
+                continue
+            q = parse_qs(urlparse(href).query)
+            d = (q.get("date", [""])[0] or "").strip()
+            if d and d not in seen:
+                seen.add(d)
+                free_dates.append(d)
+
+        free_dates.sort()
+        # если список пуст — лучше перейти в Selenium, вдруг HTML неполный
+        return free_dates if free_dates else None
     except Exception:
         return None
 
@@ -265,7 +298,7 @@ def wait_dom_complete(driver: webdriver.Chrome, timeout: int = 30) -> None:
 
 
 def _has_login_form(driver: webdriver.Chrome) -> bool:
-    sel = "form[action*='login'], input[type='password'], input[name='email'], input[name='login']"
+    sel = "form[action*='login'], input[type='password'], input[name='email'], input[name='login'], #login_form"
     try:
         return len(driver.find_elements(By.CSS_SELECTOR, sel)) > 0
     except Exception:
@@ -275,59 +308,41 @@ def _has_login_form(driver: webdriver.Chrome) -> bool:
 def _has_antibot(driver: webdriver.Chrome) -> bool:
     try:
         txt = norm_text(driver.page_source)
-        return any(x.lower() in txt.lower() for x in ["доступ ограничен", "капча", "cloudflare", "access denied", "robot"])
+        return any(x.lower() in txt.lower() for x in ["доступ ограничен", "cloudflare", "access denied", "robot"])
     except Exception:
         return False
 
 
-def _candidate_tile_elements(driver: webdriver.Chrome):
-    css = (
-        "#graphic_wrapper a, #graphic_container a, "
-        ".graphic_item, .graphic_item.free, .graphic_item.red, .graphic_item.disabled, "
-        ".talon, .talon_item, .ticket, .ticket-item, .calendar-item, "
-        ".calendar .day, .calendar .item, .day-item, .day, "
-        "[class*='talon'], [class*='ticket'], [class*='calendar'], [class*='day'], [class*='graphic_item']"
-    )
-    try:
-        return driver.find_elements(By.CSS_SELECTOR, css)
-    except Exception:
-        return []
-
 def wait_for_calendar_or_login(driver: webdriver.Chrome, timeout: int = 60) -> str:
     """
     Возвращает: SLOTS | LOGIN | ANTIBOT
-
-    Фикс под f-okno:
-    - календарь на /base/... рисуется как #graphic_wrapper с элементами .graphic_item
-    - свободные дни обычно имеют класс .graphic_item.free
     """
     end = time.time() + timeout
 
     while time.time() < end:
         url = (driver.current_url or "").lower()
 
-        # 1) антибот/капча
         if _has_antibot(driver):
             return "ANTIBOT"
 
-        # 2) признак логина
         if "/login" in url and _has_login_form(driver):
             return "LOGIN"
 
-        # 3) быстрый признак календаря по HTML (f-okno)
         ps = driver.page_source or ""
         if ("id=\"graphic_wrapper\"" in ps) or ("graphic_item" in ps):
-            # даже если нет текста, но есть график — считаем, что календарь есть
             return "SLOTS"
 
-        # 4) универсальный признак календаря по DOM (на будущее)
-        tiles = _candidate_tile_elements(driver)
-        if len(tiles) >= 6:
-            return "SLOTS"
+        # чуть мягче: если DOM уже содержит плитки календаря
+        try:
+            if driver.find_elements(By.CSS_SELECTOR, ".graphic_item"):
+                return "SLOTS"
+        except Exception:
+            pass
 
         time.sleep(0.5)
 
     raise TimeoutException(f"Timeout waiting for calendar/login. URL={driver.current_url}")
+
 
 def _find_first(driver: webdriver.Chrome, css_list: List[str]):
     for css in css_list:
@@ -336,20 +351,21 @@ def _find_first(driver: webdriver.Chrome, css_list: List[str]):
             return els[0]
     return None
 
-def perform_login(driver: webdriver.Chrome) -> None:
-    if not LOGIN_URL:
-        raise RuntimeError("LOGIN_URL не задан.")
+
+def perform_login(driver: webdriver.Chrome, login_url: str) -> None:
+    if not login_url:
+        raise RuntimeError("LOGIN_URL пустой.")
     if not F_OKNO_EMAIL or not F_OKNO_PASSWORD:
         raise RuntimeError("Нужны Secrets: F_OKNO_EMAIL и F_OKNO_PASSWORD (иначе не залогиниться).")
 
-    driver.get(LOGIN_URL)
+    driver.get(login_url)
     wait_dom_complete(driver, timeout=30)
 
     if _has_antibot(driver):
         dump_debug_artifacts(driver, reason="login_antibot")
-        raise RuntimeError("Антибот/капча на странице логина.")
+        raise RuntimeError("Ограничение доступа на странице логина.")
 
-    # Поля именно такие на их форме: name="login" и name="pass"
+    # Поля на их форме обычно name="login" и name="pass"
     email_el = _find_first(driver, ["#login_form input[name='login']", "input[name='login']"])
     pass_el = _find_first(driver, ["#login_form input[name='pass']", "input[name='pass']", "input[type='password']"])
 
@@ -369,152 +385,39 @@ def perform_login(driver: webdriver.Chrome) -> None:
         pass
     pass_el.send_keys(F_OKNO_PASSWORD)
 
-    # Ждём, пока reCAPTCHA v3 положит токен в hidden input (иногда успевает не сразу)
-    try:
-        WebDriverWait(driver, 25).until(
-            lambda d: ((d.find_element(By.ID, "g-recaptcha-response").get_attribute("value") or "").strip() not in ("", "0"))
-        )
-    except Exception:
-        logging.warning("reCAPTCHA token not ready (or not found). Trying to submit anyway.")
-
-    # Сабмитим "как на сайте": кликом по <a onclick="doForm('login_form')"> или вызовом doForm
+    # Сабмит: пытаемся кликнуть по кнопке/ссылке формы
     submit_link = _find_first(driver, [
         "#login_form a.pre_button",
         "#login_form a[onclick*='doForm']",
         "a.pre_button.blue.large",
-        "a[onclick*=\"doForm('login_form'\"]",
         "a[onclick*='doForm']",
     ])
 
     if submit_link:
         driver.execute_script("arguments[0].click();", submit_link)
     else:
-        # запасной вариант — вызвать их JS напрямую
         driver.execute_script(
             "if (typeof doForm === 'function') { doForm('login_form'); } "
             "else { document.getElementById('login_form').submit(); }"
         )
 
-    # Ждём, что либо уйдём с /login, либо появится признак авторизации
     def _logged_in(d):
         url = (d.current_url or "")
         if "/login" not in url:
             return True
         ps = norm_text(d.page_source).lower()
-        # иногда остаются на /login но меняется меню — ловим по словам "выход"
         return ("выход" in ps) or ("logout" in ps)
 
     try:
         WebDriverWait(driver, 35).until(_logged_in)
     except Exception:
-        # вытащим текст ошибки (обычно красным)
-        err = ""
-        try:
-            err = (driver.find_element(By.CSS_SELECTOR, ".pre_form_compact p[style*='color:red']").text or "").strip()
-        except Exception:
-            pass
         dump_debug_artifacts(driver, reason="login_no_redirect")
-        if err:
-            raise RuntimeError(f"Логин не прошёл: {err}")
-        raise RuntimeError("После отправки формы не ушли со страницы логина (капча/блок/неверный пароль).")
+        raise RuntimeError("После отправки формы не ушли со страницы логина (пароль/блок/верстка).")
 
     logging.info("Login OK (seems). URL now: %s", driver.current_url)
 
 
-def extract_slots_from_dom(driver: webdriver.Chrome) -> List[Dict]:
-    """
-    Главный парсер слотов прямо из DOM.
-
-    Фикс под f-okno:
-    - карточки календаря: .graphic_item
-    - свободные дни: .graphic_item.free
-    - внутри текст 'Есть места'
-    """
-    slots: List[Dict] = []
-
-    # 1) Самый надёжный путь: f-okno конкретно
-    try:
-        free_cards = driver.find_elements(By.CSS_SELECTOR, ".graphic_item.free")
-    except Exception:
-        free_cards = []
-
-    for card in free_cards:
-        try:
-            txt = norm_text(card.text)
-        except Exception:
-            continue
-        if not txt:
-            continue
-
-        # На всякий случай проверим маркер "Есть места"
-        if not FREE_RE.search(txt):
-            # иногда текст внутри может быть в дочернем, попробуем innerText
-            try:
-                inner = norm_text(card.get_attribute("innerText") or "")
-            except Exception:
-                inner = ""
-            if not FREE_RE.search(inner):
-                continue
-            txt = inner
-
-        d = _extract_date_from_text(txt)
-        slots.append({"date": d or "Есть места (даты не распознаны)", "status": "Свободно"})
-
-    if slots:
-        # уникализация по дате
-        uniq: List[Dict] = []
-        seen = set()
-        for it in slots:
-            if it["date"] in seen:
-                continue
-            seen.add(it["date"])
-            uniq.append(it)
-        return uniq
-
-    # 2) Если свободных не нашли — соберём "Нет мест" (полезно для snapshot)
-    try:
-        no_cards = driver.find_elements(By.CSS_SELECTOR, ".graphic_item.red, .graphic_item.disabled")
-    except Exception:
-        no_cards = []
-
-    for card in no_cards:
-        try:
-            txt = norm_text(card.text)
-        except Exception:
-            continue
-        if not txt:
-            continue
-
-        if not NO_RE.search(txt):
-            try:
-                inner = norm_text(card.get_attribute("innerText") or "")
-            except Exception:
-                inner = ""
-            if not NO_RE.search(inner):
-                continue
-            txt = inner
-
-        d = _extract_date_from_text(txt)
-        if d:
-            slots.append({"date": d, "status": "Нет мест"})
-
-    if slots:
-        # уникализация по (date,status)
-        uniq: List[Dict] = []
-        seen = set()
-        for it in slots:
-            key = (it["date"], it["status"])
-            if key in seen:
-                continue
-            seen.add(key)
-            uniq.append(it)
-        return uniq
-
-    # 3) Fallback: парсинг из HTML (если DOM-структура не совпала)
-    return parse_slots_from_html(driver.page_source or "")
-
-
-def open_target_with_login_if_needed(driver: webdriver.Chrome) -> None:
+def open_target_with_login_if_needed(driver: webdriver.Chrome, login_url: str, login_counter: Dict[str, int]) -> None:
     driver.get(TARGET_URL)
     wait_dom_complete(driver, timeout=30)
 
@@ -523,14 +426,19 @@ def open_target_with_login_if_needed(driver: webdriver.Chrome) -> None:
 
     if state == "ANTIBOT":
         dump_debug_artifacts(driver, reason="target_antibot")
-        raise RuntimeError("Антибот/ограничение доступа на TARGET_URL.")
+        raise RuntimeError("Ограничение доступа на TARGET_URL.")
 
     if state == "SLOTS":
         return
 
     # LOGIN
+    if login_counter["count"] >= MAX_LOGINS_PER_RUN:
+        dump_debug_artifacts(driver, reason="too_many_logins")
+        raise RuntimeError("Слишком много редиректов на логин за один запуск.")
+
     dump_debug_artifacts(driver, reason="redirected_to_login")
-    perform_login(driver)
+    login_counter["count"] += 1
+    perform_login(driver, login_url)
 
     driver.get(TARGET_URL)
     wait_dom_complete(driver, timeout=30)
@@ -540,79 +448,113 @@ def open_target_with_login_if_needed(driver: webdriver.Chrome) -> None:
 
     if state2 != "SLOTS":
         dump_debug_artifacts(driver, reason="still_not_slots_after_login")
-        raise RuntimeError("После логина не увидели календарь (капча/блок/не та учётка/верстка).")
+        raise RuntimeError("После логина не увидели календарь (блок/не та учётка/верстка).")
 
 
-# ---------- main ----------
+def single_check_and_notify(driver: webdriver.Chrome, login_url: str, login_counter: Dict[str, int]) -> bool:
+    """
+    Возвращает True если отправили уведомление (нашли НОВЫЕ свободные даты).
+    """
+    open_target_with_login_if_needed(driver, login_url, login_counter)
+
+    # на всякий — дождаться появления элементов календаря (вместо sleep)
+    try:
+        WebDriverWait(driver, 10).until(lambda d: len(d.find_elements(By.CSS_SELECTOR, ".graphic_item")) > 0)
+    except Exception:
+        pass
+
+    # артефакты страницы (полезно при спорных кейсах)
+    Path("page.html").write_text(driver.page_source or "", encoding="utf-8")
+    try:
+        driver.save_screenshot("page.png")
+    except Exception:
+        pass
+
+    label = extract_label_from_h1(driver)
+    free_dates = extract_free_dates_from_dom(driver)
+
+    logging.info("Label: %s", label)
+    logging.info("Free dates: %s", free_dates)
+
+    last_free = load_last_free_dates()
+
+    # Режим: уведомляем только когда есть свободные и они отличаются от предыдущих
+    if free_dates and free_dates != last_free:
+        ts = datetime.now(MOSCOW_TZ).strftime("%Y-%m-%d %H:%M")
+        text = (
+            f"🚨 Появились свободные слоты в <b>{label}</b>! [{ts}]\n\n"
+            f"{format_free_dates(free_dates)}\n\n"
+            f"Открыть календарь: <a href='{TARGET_URL}'>страница записи</a>"
+        )
+        send_tg(text)
+        save_free_dates(free_dates)
+        logging.info("Sent notification + saved free_dates.")
+        return True
+
+    # Ничего не отправляем (как ты просила)
+    if not free_dates:
+        logging.info("No free dates — silent.")
+    else:
+        logging.info("Free dates unchanged — silent.")
+    return False
+
+
 def one_check_run() -> None:
-    # 0) Быстрый путь через requests (если возможно)
+    # login_url: explicit override OR computed from TARGET_URL
+    login_url = LOGIN_URL or build_login_url_from_target(TARGET_URL)
+    login_counter = {"count": 0}
+
+    # 0) Быстрый путь через requests (опционально)
     if TRY_REQUESTS_FIRST:
-        slots = try_requests_fetch()
-        if slots is not None:
-            has_free = any(s.get("status") == "Свободно" for s in slots)
-            logging.info("Requests: got %d slots, free=%s", len(slots), has_free)
-
-            snapshot = json.dumps(slots, ensure_ascii=False, sort_keys=True)
-            last = load_last_snapshot()
-
-            if snapshot != last:
-                if has_free or (not ONLY_NOTIFY_WHEN_FREE):
-                    ts = datetime.now(MOSCOW_TZ).strftime("%Y-%m-%d %H:%M")
-                    text = (
-                        f"🚨 Появились свободные слоты в {SIZO_LABEL}! [{ts}]\n\n"
-                        f"{format_slots(slots, only_available=True)}\n\n"
-                        f"Записаться тут: <a href='{TARGET_URL}'>страница записи</a>"
-                    )
-                    send_tg(text)
-                save_snapshot(snapshot)
-                logging.info("Snapshot изменился — сохранено (requests).")
+        free_dates = try_requests_fetch_free_dates()
+        if free_dates is not None:
+            last_free = load_last_free_dates()
+            if free_dates and free_dates != last_free:
+                ts = datetime.now(MOSCOW_TZ).strftime("%Y-%m-%d %H:%M")
+                text = (
+                    f"🚨 Появились свободные слоты в <b>{SIZO_LABEL_FALLBACK}</b>! [{ts}]\n\n"
+                    f"{format_free_dates(free_dates)}\n\n"
+                    f"Открыть календарь: <a href='{TARGET_URL}'>страница записи</a>"
+                )
+                send_tg(text)
+                save_free_dates(free_dates)
+                logging.info("Sent + saved free_dates (requests).")
             else:
-                logging.info("Без изменений (requests).")
-            return  # всё, Selenium не нужен
+                logging.info("Requests: silent (no free or unchanged).")
+            return
 
     # 1) Selenium путь
     driver = make_driver()
     try:
-        open_target_with_login_if_needed(driver)
+        if BURST_MINUTES <= 0:
+            single_check_and_notify(driver, login_url, login_counter)
+            return
 
-        # дать JS дорисовать календарь (иногда реально нужно)
-        time.sleep(2.0)
+        end = time.time() + BURST_MINUTES * 60
+        sent_any = False
 
-        # артефакты всегда полезны
-        Path("page.html").write_text(driver.page_source or "", encoding="utf-8")
-        try:
-            driver.save_screenshot("page.png")
-        except Exception:
-            pass
+        while time.time() < end:
+            try:
+                sent = single_check_and_notify(driver, login_url, login_counter)
+                sent_any = sent_any or sent
+            except Exception:
+                # при ошибке — сохраняем артефакты, но уведомление "ошибка" НЕ шлём (ты этого не просила)
+                logging.exception("Check failed inside burst loop")
+                try:
+                    dump_debug_artifacts(driver, reason="burst_error")
+                except Exception:
+                    pass
+                # при ошибке можно попробовать продолжить, но без фанатизма
+            # пауза с небольшим разбросом (чтобы не быть "ровным роботом")
+            # без random, чтобы не тащить импорт — делаем простую псевдо-джиттер логику
+            # (зависит от текущих секунд)
+            now = int(time.time())
+            span = max(1.0, BURST_SLEEP_MAX - BURST_SLEEP_MIN)
+            jitter = (now % int(span + 1))  # 0..span
+            sleep_s = BURST_SLEEP_MIN + float(jitter)
+            time.sleep(sleep_s)
 
-        slots = extract_slots_from_dom(driver)
-        has_free = any(s.get("status") == "Свободно" for s in slots)
-
-        free_dates = [(s.get("date") or "").strip() for s in slots if s.get("status") == "Свободно"]
-        if free_dates:
-            logging.info("===> Найдены свободные слоты: %d шт.", len(free_dates))
-            for d in free_dates:
-                logging.info("FREE_DATE: %s", d)
-        else:
-            logging.info("===> Свободных слотов нет.")
-
-        snapshot = json.dumps(slots, ensure_ascii=False, sort_keys=True)
-        last = load_last_snapshot()
-
-        if snapshot != last:
-            if has_free or (not ONLY_NOTIFY_WHEN_FREE):
-                ts = datetime.now(MOSCOW_TZ).strftime("%Y-%m-%d %H:%M")
-                text = (
-                    f"🚨 Появились свободные слоты в {SIZO_LABEL}! [{ts}]\n\n"
-                    f"{format_slots(slots, only_available=True)}\n\n"
-                    f"Записаться тут: <a href='{TARGET_URL}'>страница записи</a>"
-                )
-                send_tg(text)
-
-            save_snapshot(snapshot)
-            logging.info("Snapshot изменился — сохранено.")
-        else:
-            logging.info("Без изменений (snapshot не менялся).")
+        logging.info("Burst finished. sent_any=%s", sent_any)
 
     except Exception:
         logging.exception("FATAL")
