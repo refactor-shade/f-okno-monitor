@@ -49,3 +49,14 @@ jobs:
           SE_MANAGER_USE_PATH: "0"
           TZ: Europe/Moscow
         run: python f_okno_monitor_selenium.py
+
+        - name: Upload debug artifacts
+          if: always()
+          uses: actions/upload-artifact@v4
+          with:
+            name: debug
+            path: |
+              debug/*
+              page.html
+              page.png
+
