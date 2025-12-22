@@ -34,7 +34,7 @@ jobs:
 
       # Optional burst mode (to catch minute-long slots):
       # 0 = disabled (single check). Try 20 for a 20-minute run.
-      BURST_MINUTES: "0"
+      BURST_MINUTES: "15"
       BURST_SLEEP_MIN: "75"
       BURST_SLEEP_MAX: "105"
       MAX_LOGINS_PER_RUN: "2"
