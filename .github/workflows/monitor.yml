@@ -22,7 +22,7 @@ jobs:
       F_OKNO_PASSWORD: ${{ secrets.F_OKNO_PASSWORD }}
 
       # Only one link required
-      TARGET_URL: "https://f-okno.ru/base/moscovskaya_oblast/sizo11noginsk"
+      TARGET_URL: "https://f-okno.ru/base/moscow/si12zelenograd"
 
       # Optional: you can omit these; label is auto from <h1>
       SIZO_LABEL: "СИЗО"
