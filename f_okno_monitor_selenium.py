@@ -225,7 +225,6 @@ def perform_login(driver: webdriver.Chrome) -> None:
         dump_debug_artifacts(driver, reason="login_antibot")
         raise RuntimeError("На странице логина антибот/капча — Selenium в GitHub Actions не проходит.")
 
-    # Попробуем найти поля максимально “мягко”
     email_el = _find_first(driver, [
         "input[type='email']",
         "input[name='email']",
@@ -255,7 +254,6 @@ def perform_login(driver: webdriver.Chrome) -> None:
         pass
     pass_el.send_keys(F_OKNO_PASSWORD)
 
-    # Кнопка submit
     submit = _find_first(driver, [
         "button[type='submit']",
         "input[type='submit']",
@@ -265,14 +263,11 @@ def perform_login(driver: webdriver.Chrome) -> None:
     if submit:
         submit.click()
     else:
-        # fallback: Enter в пароле
         pass_el.send_keys(Keys.ENTER)
 
-    # ждём, что уйдём с /login (или хотя бы исчезнет форма)
     try:
         WebDriverWait(driver, 25).until(lambda d: "/login" not in (d.current_url or ""))
     except Exception:
-        # могли остаться на логине из-за ошибки/капчи
         dump_debug_artifacts(driver, reason="login_no_redirect")
         raise RuntimeError("После отправки формы не ушли со страницы логина (возможна капча/неверный пароль).")
 
@@ -285,8 +280,11 @@ _MONTHS = "января|февраля|марта|апреля|мая|июня|�
 _WEEKDAYS = "понедельник|вторник|среда|четверг|пятница|суббота|воскресенье"
 _DATE_RE = re.compile(rf"\b(\d{{1,2}})\s+({_MONTHS})(?:\s+({_WEEKDAYS}))?\b", re.IGNORECASE)
 
-_FREE_MARKERS = ("Есть места", "Доступно", "Свобод")
-_NO_MARKERS = ("Свободных мест нет", "Свободных дат нет", "Нет мест")
+# ВАЖНО: более “широкие” маркеры (учитываем NBSP и разные формулировки)
+def norm_text(s: str) -> str:
+    s = (s or "").replace("\xa0", " ")
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
 
 
 def _make_soup(html: str) -> BeautifulSoup:
@@ -299,76 +297,73 @@ def _make_soup(html: str) -> BeautifulSoup:
 
 
 def parse_slots_from_html(html: str) -> List[Dict]:
+    """
+    Возвращает список:
+    [{"date": "23 декабря вторник", "status": "Свободно"|"Нет мест"}, ...]
+    Устойчиво к NBSP/переносам и вложенным элементам.
+    """
     soup = _make_soup(html)
     slots: List[Dict] = []
 
-    candidate_nodes = soup.select(
-        ".talon, .talon_item, .ticket, .ticket-item, .calendar-item, "
-        ".calendar .day, .calendar .item, .day-item, .day, "
-        "[class*='talon'], [class*='ticket'], [class*='calendar']"
-    )
+    free_re = re.compile(r"есть\s*мест", re.IGNORECASE)
+    no_re = re.compile(r"(свободных\s*мест\s*нет|свободных\s*дат\s*нет|нет\s*мест)", re.IGNORECASE)
 
-    def status_from_text(t: str) -> Optional[str]:
-        tl = t.lower()
-        if any(x.lower() in tl for x in _FREE_MARKERS):
-            return "Свободно"
-        if any(x.lower() in tl for x in _NO_MARKERS):
-            return "Нет мест"
-        return None
-
-    def date_from_text(t: str) -> str:
+    def extract_date(text: str) -> str:
+        t = norm_text(text)
         m = _DATE_RE.search(t)
         if m:
             return m.group(0).strip()
-        t2 = re.sub(r"\s+", " ", t).strip()
-        for junk in (*_FREE_MARKERS, *_NO_MARKERS):
-            t2 = t2.replace(junk, "").strip()
-        return t2
+        m2 = re.search(rf"\b(\d{{1,2}})\s+({_MONTHS})\b", t, re.IGNORECASE)
+        if m2:
+            return m2.group(0).strip()
+        return ""
 
-    if candidate_nodes:
-        for node in candidate_nodes:
-            t = node.get_text(" ", strip=True)
-            if not t:
+    def climb_for_card_text(node) -> str:
+        cur = node
+        for _ in range(6):
+            if not cur:
+                break
+            try:
+                txt = norm_text(cur.get_text(" ", strip=True))
+            except Exception:
+                txt = ""
+            if txt:
+                if _DATE_RE.search(txt) or re.search(rf"\b(\d{{1,2}})\s+({_MONTHS})\b", txt, re.IGNORECASE):
+                    return txt
+            cur = getattr(cur, "parent", None)
+        try:
+            return norm_text(node.parent.get_text(" ", strip=True)) if node and node.parent else ""
+        except Exception:
+            return ""
+
+    # 1) Свободные слоты: ищем все вхождения “Есть места”
+    for s in soup.find_all(string=free_re):
+        card_text = climb_for_card_text(getattr(s, "parent", None))
+        d = extract_date(card_text)
+        if d:
+            slots.append({"date": d, "status": "Свободно"})
+        else:
+            slots.append({"date": "Есть места (даты не распознаны)", "status": "Свободно"})
+
+    if slots:
+        uniq = []
+        seen = set()
+        for it in slots:
+            key = it["date"]
+            if key in seen:
                 continue
-            st = status_from_text(t)
-            if st is None:
-                continue
-            d = date_from_text(t)
-            if d and len(d) >= 3:
-                slots.append({"date": d, "status": st})
+            seen.add(key)
+            uniq.append(it)
+        return uniq
 
-        if slots:
-            uniq = []
-            seen = set()
-            for s in slots:
-                key = (s.get("date"), s.get("status"))
-                if key in seen:
-                    continue
-                seen.add(key)
-                uniq.append(s)
-            return uniq
+    # 2) Если свободных не нашли — соберём “нет мест” (полезно для snapshot)
+    for s in soup.find_all(string=no_re):
+        card_text = climb_for_card_text(getattr(s, "parent", None))
+        d = extract_date(card_text)
+        if d:
+            slots.append({"date": d, "status": "Нет мест"})
 
-    full_text = soup.get_text("\n", strip=True)
-    lines = [ln.strip() for ln in full_text.splitlines() if ln.strip()]
-
-    free_lines = [ln for ln in lines if any(x.lower() in ln.lower() for x in _FREE_MARKERS)]
-    if free_lines:
-        found_dates = []
-        for ln in free_lines:
-            m = _DATE_RE.search(ln)
-            if m:
-                found_dates.append(m.group(0).strip())
-
-        if found_dates:
-            uniq = []
-            for d in found_dates:
-                if d not in uniq:
-                    uniq.append(d)
-            return [{"date": d, "status": "Свободно"} for d in uniq]
-
-        return [{"date": "Есть места (даты не распознаны)", "status": "Свободно"}]
-
-    return []
+    return slots
 
 
 # ---------- основной прогон ----------
@@ -377,7 +372,6 @@ def open_target_with_login_if_needed(driver: webdriver.Chrome) -> None:
     Пытаемся открыть TARGET_URL.
     Если редирект на логин — логинимся и повторяем.
     """
-    # 1) первый заход
     driver.get(TARGET_URL)
     wait_dom_complete(driver, timeout=30)
     marker = wait_for_any_marker(driver, timeout=45)
@@ -390,7 +384,6 @@ def open_target_with_login_if_needed(driver: webdriver.Chrome) -> None:
     if marker != "LOGIN_FORM":
         return
 
-    # 2) логин и повтор
     logging.info("Redirected to login. Trying to login...")
     dump_debug_artifacts(driver, reason="redirected_to_login")
 
