@@ -45,7 +45,7 @@ Telegram-бот для мониторинга сайта **f-okno.ru**
 
 1. Откройте в браузере ссылку ниже, но замените фразу <ВАШ_BOT_TOKEN> на сам токен бота:
    https://api.telegram.org/bot<ВАШ_BOT_TOKEN>/getUpdates
-   Должна получиться ссылка формата https://api.telegram.org/bot0123456789:ABCDeFgjklMNOPQrsTu1VwXwzA2B-cd3FG4H/getUpdates
+Должна получиться ссылка в таком формате (это **не работающий пример**) https://api.telegram.org/bot0123456789:ABCDeFgjklMNOPQrsTu1VwXwzA2B-cd3FG4H/getUpdates
 3. Напишите боту любое сообщение в Telegram от своего имени
 4. На странице 'getUpdates' в браузере найдите строчку:
    "chat": { "id": 123456789 }
