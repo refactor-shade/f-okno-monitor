@@ -33,8 +33,8 @@ jobs:
       STATE_FILE: "state.json"
 
       # Optional burst mode (to catch minute-long slots):
-      # 0 = disabled (single check). Try 20 for a 20-minute run.
-      BURST_MINUTES: "15"
+      # 0 = disabled (single check). Try 10 for a 10-minute run.
+      BURST_MINUTES: "9"
       BURST_SLEEP_MIN: "75"
       BURST_SLEEP_MAX: "105"
       MAX_LOGINS_PER_RUN: "2"
